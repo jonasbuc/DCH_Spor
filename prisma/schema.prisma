@@ -1,0 +1,250 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum RestrictedGeometryKind {
+  POLYGON
+  LINE
+  CIRCLE
+}
+
+enum ExportFormat {
+  PNG
+  PDF
+  SVG
+  GEOJSON
+  PROJECT_JSON
+  TRACK_SHEET
+}
+
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  name      String
+  projects  Project[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+model Project {
+  id                         String               @id @default(cuid())
+  ownerId                    String
+  owner                      User                 @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name                       String
+  club                       String               @default("")
+  eventName                  String               @default("")
+  eventDate                  DateTime?
+  description                String               @default("")
+  notes                      String               @default("")
+  requestedTrackCount        Int                  @default(6)
+  edgeMarginMeters           Float                @default(8)
+  minimumTrackSpacingMeters  Float                @default(15)
+  autosaveVersion            Int                  @default(1)
+  snapshot                   String               @default("{}")
+  field                      Field?
+  tracks                     Track[]
+  restrictedAreas            RestrictedArea[]
+  validationSnapshots        ValidationSnapshot[]
+  exports                    Export[]
+  versions                   ProjectVersion[]
+  createdAt                  DateTime             @default(now())
+  updatedAt                  DateTime             @updatedAt
+
+  @@index([ownerId])
+}
+
+model Field {
+  id             String          @id @default(cuid())
+  projectId      String          @unique
+  project        Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name           String
+  areaM2         Float
+  areaHa         Float
+  perimeterM     Float           @default(0)
+  dimensionsJson String          @default("{}")
+  sourceType     String          @default("image")
+  mapReference   String          @default("")
+  images         FieldImage[]
+  calibration    Calibration?
+  polygon        FieldPolygon?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+}
+
+model FieldImage {
+  id              String    @id @default(cuid())
+  fieldId         String
+  field           Field     @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+  originalName    String
+  mimeType        String
+  byteSize        Int
+  storagePath     String
+  widthPixels     Int?
+  heightPixels    Int?
+  rotationDegrees Float     @default(0)
+  cropJson        String    @default("{}")
+  createdAt       DateTime  @default(now())
+}
+
+model Calibration {
+  id               String   @id @default(cuid())
+  fieldId          String   @unique
+  field            Field    @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+  method           String
+  meterPerPixel    Float
+  knownDistanceM   Float?
+  knownAreaM2      Float?
+  knownWidthM      Float?
+  knownHeightM     Float?
+  calculatedAreaM2 Float?
+  deviationPercent Float?
+  warningDa        String   @default("")
+  detailsJson      String   @default("{}")
+  updatedAt        DateTime @updatedAt
+}
+
+model FieldPolygon {
+  id          String   @id @default(cuid())
+  fieldId     String   @unique
+  field       Field    @relation(fields: [fieldId], references: [id], onDelete: Cascade)
+  geometry    String
+  areaM2      Float
+  perimeterM  Float
+  updatedAt   DateTime @updatedAt
+}
+
+model RestrictedArea {
+  id                   String                 @id @default(cuid())
+  projectId            String
+  project              Project                @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name                 String
+  kind                 RestrictedGeometryKind
+  areaType             String
+  description          String                 @default("")
+  safetyDistanceMeters Float                  @default(0)
+  color                String                 @default("#d9480f")
+  active               Boolean                @default(true)
+  geometry             String
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+
+  @@index([projectId])
+}
+
+model TrackTemplate {
+  id          String      @id @default(cuid())
+  code        String      @unique
+  name        String
+  description String      @default("")
+  rules       String
+  editable    Boolean     @default(true)
+  tracks      Track[]
+  trackRules  TrackRule[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+}
+
+model TrackRule {
+  id          String        @id @default(cuid())
+  templateId  String
+  template    TrackTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  key         String
+  labelDa     String
+  valueNumber Float?
+  valueText   String?
+  unit        String        @default("")
+  editable    Boolean       @default(true)
+
+  @@unique([templateId, key])
+}
+
+model Track {
+  id           String          @id @default(cuid())
+  projectId    String
+  project      Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  templateId   String?
+  template     TrackTemplate?  @relation(fields: [templateId], references: [id])
+  displayNo    Int
+  name         String
+  color        String
+  geometry     String
+  lengthSteps  Float
+  stepLengthM  Float
+  lengthMeters Float
+  rotationDeg  Float           @default(0)
+  lockedLength Boolean         @default(true)
+  lockedAngles Boolean         @default(true)
+  points       TrackPoint[]
+  objects      TrackObject[]
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@unique([projectId, displayNo])
+  @@index([projectId])
+}
+
+model TrackPoint {
+  id        String   @id @default(cuid())
+  trackId   String
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  order     Int
+  x         Float
+  y         Float
+  createdAt DateTime @default(now())
+
+  @@unique([trackId, order])
+}
+
+model TrackObject {
+  id                       String   @id @default(cuid())
+  trackId                  String
+  track                    Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  displayNo                Int
+  distanceAlongTrackMeters Float
+  material                 String   @default("træ")
+  description              String   @default("")
+  marksFinish              Boolean  @default(false)
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@unique([trackId, displayNo])
+}
+
+model ValidationSnapshot {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  result    String
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+}
+
+model Export {
+  id        String       @id @default(cuid())
+  projectId String
+  project   Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  format    ExportFormat
+  fileName  String
+  filePath  String       @default("")
+  metadata  String       @default("{}")
+  createdAt DateTime     @default(now())
+
+  @@index([projectId])
+}
+
+model ProjectVersion {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  label     String
+  snapshot  String
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+}

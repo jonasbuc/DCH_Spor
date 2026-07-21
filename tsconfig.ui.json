@@ -1,0 +1,30 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false,
+    "types": ["react", "react-dom"]
+  },
+  "include": [
+    "src/types/**/*.d.ts",
+    "src/app/**/*.tsx",
+    "src/components/**/*.ts",
+    "src/components/**/*.tsx",
+    "src/stores/**/*.ts",
+    "src/lib/**/*.ts",
+    "src/domain/**/*.ts",
+    "src/geometry/**/*.ts",
+    "src/workers/**/*.ts",
+    "src/utils/**/*.ts",
+    "src/server/project-repository.ts",
+    "src/server/auth.ts",
+    "src/server/prisma-minimal.ts",
+    "src/server/db.ts"
+  ],
+  "exclude": [
+    "src/app/api/**",
+    "src/domain/domain.test.ts",
+    "src/server/schemas/project.ts",
+    "node_modules",
+    ".next"
+  ]
+}

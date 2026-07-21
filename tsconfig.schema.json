@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false,
+    "types": [],
+    "typeRoots": ["./types-empty"]
+  },
+  "include": ["src/types/**/*.d.ts", "src/domain/types.ts", "src/server/schemas/project.ts"],
+  "exclude": ["node_modules", ".next"]
+}

@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "incremental": false,
+    "types": [],
+    "typeRoots": ["./types-empty"]
+  },
+  "include": [
+    "src/types/**/*.d.ts",
+    "src/domain/**/*.ts",
+    "src/geometry/**/*.ts",
+    "src/utils/**/*.ts",
+    "src/server/**/*.ts",
+    "prisma/**/*.ts"
+  ],
+  "exclude": ["node_modules", ".next"]
+}

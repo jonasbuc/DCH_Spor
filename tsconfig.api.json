@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false,
+    "types": ["react", "react-dom"]
+  },
+  "include": [
+    "src/types/**/*.d.ts",
+    "src/middleware.ts",
+    "src/app/api/**/*.ts",
+    "src/server/**/*.ts",
+    "src/domain/**/*.ts",
+    "src/geometry/**/*.ts",
+    "src/utils/**/*.ts"
+  ],
+  "exclude": ["src/domain/domain.test.ts", "node_modules", ".next"]
+}

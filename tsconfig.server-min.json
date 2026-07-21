@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false,
+    "types": [],
+    "typeRoots": ["./types-empty"]
+  },
+  "include": ["src/types/**/*.d.ts", "src/server/db.ts", "src/server/prisma-minimal.ts", "src/server/auth.ts"],
+  "exclude": ["node_modules", ".next"]
+}

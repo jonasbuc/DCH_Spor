@@ -1,0 +1,6 @@
+node_modules
+.next
+coverage
+dist
+playwright-report
+prisma/dev.db
