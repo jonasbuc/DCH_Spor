@@ -136,6 +136,12 @@ h3 {
   gap: 8px;
 }
 
+.toolbar.tight {
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
 .grid {
   display: grid;
   min-height: calc(100vh - 70px);
@@ -291,6 +297,7 @@ h3 {
 
 .mix-panel,
 .placement-summary,
+.rule-guide-card,
 .rule-summary {
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -338,6 +345,25 @@ h3 {
 .rule-list {
   display: grid;
   gap: 7px;
+}
+
+.rule-guide-card {
+  display: grid;
+  gap: 8px;
+}
+
+.guide-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  min-height: 0;
+  text-align: left;
+}
+
+.guide-row span {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
 }
 
 .rule-row {

@@ -17,9 +17,17 @@ import { createDemoProject } from "@/domain/demo-data";
 import { dchTrackTemplates } from "@/domain/rules/templates";
 import { createTrackFromShape } from "@/domain/track/create-track";
 import { validateProject } from "@/domain/validation/validation";
+import { distanceBetweenSegments } from "@/geometry/distances";
 import { autoPlaceTracks } from "@/geometry/placement/auto-placement";
 import { polygonBounds, calculatePolygonArea, calculatePolygonPerimeter } from "@/geometry/polygons";
-import { calculateSegmentLengths, calculateTrackLength, calculateTurnAngles, coordinateAtDistance } from "@/geometry/polylines";
+import {
+  calculateSegmentLengths,
+  calculateTrackLength,
+  calculateTurnAngles,
+  coordinateAtDistance,
+  distance,
+  segmentsIntersect
+} from "@/geometry/polylines";
 import { mirrorTrack, rotatePoint, rotateTrack, translateTrack } from "@/geometry/transforms";
 import { createMapReference, latLonToLocalMeters } from "@/geometry/map-projection";
 import { projectToGeoJson, projectToSvg } from "@/domain/export/exporters";
@@ -46,6 +54,32 @@ type PlacementReport = {
   directionDegrees: number;
   triedDirections: number[];
   summary: string;
+};
+type DistanceGuide = {
+  id: string;
+  label: string;
+  from: Coordinate;
+  to: Coordinate;
+  distanceMeters: number;
+  requiredMeters: number;
+  status: RuleStatus;
+  trackId: string;
+  relatedTrackId?: string;
+};
+type IntersectionGuide = {
+  id: string;
+  label: string;
+  position: Coordinate;
+  trackId: string;
+  relatedTrackId: string;
+};
+type RuleGuideOverlay = {
+  guideTrackIds: string[];
+  edgeGuides: DistanceGuide[];
+  trackGuides: DistanceGuide[];
+  intersections: IntersectionGuide[];
+  errorCount: number;
+  warningCount: number;
 };
 type TrackProfile = {
   code: string;
@@ -134,6 +168,10 @@ function PreviewApp() {
   const selectedTrackRuleChecks = useMemo(
     () => (selectedTrack ? buildTrackRuleChecks(project, selectedTrack, validation) : []),
     [project, selectedTrack, validation]
+  );
+  const ruleGuideOverlay = useMemo(
+    () => buildRuleGuideOverlay(project, selectedTrackIds, validation),
+    [project, selectedTrackIds, validation]
   );
 
   function commit(next: ProjectSnapshot, text = "Ændring gemt i preview-state") {
@@ -394,6 +432,7 @@ function PreviewApp() {
       return;
     }
 
+    setShowRuleGuides(true);
     if (check.trackId) {
       setSelectedTrackIds([check.trackId]);
     }
@@ -401,6 +440,16 @@ function PreviewApp() {
     const size = Math.max(70, Math.min(viewBox.width, viewBox.height) * 0.45);
     setViewBox({ x: check.position.x - size / 2, y: check.position.y - size / 2, width: size, height: size });
     setStage(check.detail);
+  }
+
+  function focusGuide(guide: DistanceGuide | IntersectionGuide) {
+    const position = "position" in guide ? guide.position : midpoint(guide.from, guide.to);
+    const size = Math.max(70, Math.min(viewBox.width, viewBox.height) * 0.5);
+    setShowRuleGuides(true);
+    setSelectedTrackIds([guide.trackId]);
+    setFocusTarget({ position, label: guide.label, trackId: guide.trackId });
+    setViewBox({ x: position.x - size / 2, y: position.y - size / 2, width: size, height: size });
+    setStage(guide.label);
   }
 
   function focusTrack(track: Track) {
@@ -885,7 +934,10 @@ function PreviewApp() {
                 Fejllabels
               </button>
             </div>
-            <span className="pill">{stage}</span>
+            <div className="toolbar tight">
+              <RuleGuideMiniSummary overlay={ruleGuideOverlay} />
+              <span className="pill">{stage}</span>
+            </div>
           </div>
           <div className="canvas-wrap">
             <svg
@@ -909,7 +961,7 @@ function PreviewApp() {
             >
               {project.field.backgroundImage ? <BackgroundImage image={project.field.backgroundImage} /> : null}
               <polygon points={project.field.polygon.map(pointToSvg).join(" ")} fill="#d9eed9" stroke="#2f6235" strokeWidth={1.6} opacity={0.86} />
-              {showRuleGuides ? <RuleGuides project={project} selectedTrackIds={selectedTrackIds} /> : null}
+              {showRuleGuides ? <RuleGuides project={project} overlay={ruleGuideOverlay} viewBox={viewBox} /> : null}
               {!showIssueLabels ? <IssueMarkers messages={messages} /> : null}
               {project.restrictedAreas.map((area) =>
                 area.type === "polygon" ? (
@@ -1014,6 +1066,7 @@ function PreviewApp() {
             ) : (
               <div className="message warning">Vælg et spor for at se regelstatus.</div>
             )}
+            <RuleGuidePanel overlay={ruleGuideOverlay} onFocus={focusGuide} />
           </section>
 
           <section className="section stack">
@@ -1171,6 +1224,54 @@ function PlacementSummary({ report }: { report: PlacementReport }) {
   );
 }
 
+function RuleGuideMiniSummary({ overlay }: { overlay: RuleGuideOverlay }) {
+  const className = overlay.errorCount > 0 ? "error" : overlay.warningCount > 0 ? "warning" : "ok";
+
+  return (
+    <span className={`pill ${className}`}>
+      {overlay.errorCount > 0
+        ? `${overlay.errorCount} regelbrud`
+        : overlay.warningCount > 0
+          ? `${overlay.warningCount} tæt på`
+          : "Regler ok"}
+    </span>
+  );
+}
+
+function RuleGuidePanel({ overlay, onFocus }: { overlay: RuleGuideOverlay; onFocus: (guide: DistanceGuide | IntersectionGuide) => void }) {
+  const distanceGuides = [...overlay.edgeGuides, ...overlay.trackGuides].filter((guide) => guide.status !== "ok");
+  const guides = [...overlay.intersections, ...distanceGuides].slice(0, 6);
+
+  return (
+    <div className="rule-guide-card">
+      <div className="toolbar">
+        <strong>Overlay</strong>
+        <span className="small">
+          {overlay.guideTrackIds.length} spor · {overlay.intersections.length} kryds
+        </span>
+      </div>
+      {guides.length === 0 ? (
+        <p className="small">Ingen synlige afstandsbrud for de markerede spor.</p>
+      ) : (
+        <div className="stack">
+          {guides.map((guide) => (
+            <button key={guide.id} className="guide-row" onClick={() => onFocus(guide)}>
+              <strong>{guide.label}</strong>
+              {"distanceMeters" in guide ? (
+                <span>
+                  {formatMeters(guide.distanceMeters)} / krav {formatMeters(guide.requiredMeters)}
+                </span>
+              ) : (
+                <span>Kryds mellem spor</span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BackgroundImage({ image }: { image: FieldBackgroundImage }) {
   const cropLeft = image.widthMeters * (image.crop.leftPercent / 100);
   const cropTop = image.heightMeters * (image.crop.topPercent / 100);
@@ -1242,7 +1343,10 @@ function IssueLabels({ messages }: { messages: ValidationMessage[] }) {
   );
 }
 
-function RuleGuides({ project, selectedTrackIds }: { project: ProjectSnapshot; selectedTrackIds: string[] }) {
+function RuleGuides({ project, overlay, viewBox }: { project: ProjectSnapshot; overlay: RuleGuideOverlay; viewBox: ViewBoxState }) {
+  const textSize = Math.max(4.4, viewBox.width / 95);
+  const markerSize = Math.max(4, viewBox.width / 95);
+
   return (
     <g pointerEvents="none">
       <polygon
@@ -1253,7 +1357,7 @@ function RuleGuides({ project, selectedTrackIds }: { project: ProjectSnapshot; s
         opacity={0.08}
       />
       {project.tracks
-        .filter((track) => selectedTrackIds.includes(track.id))
+        .filter((track) => overlay.guideTrackIds.includes(track.id))
         .map((track) => (
           <polyline
             key={`guide-${track.id}`}
@@ -1266,6 +1370,62 @@ function RuleGuides({ project, selectedTrackIds }: { project: ProjectSnapshot; s
             opacity={0.12}
           />
         ))}
+      {[...overlay.edgeGuides, ...overlay.trackGuides].map((guide) => (
+        <g key={guide.id}>
+          <line
+            x1={guide.from.x}
+            y1={guide.from.y}
+            x2={guide.to.x}
+            y2={guide.to.y}
+            stroke={guide.status === "error" ? "#c92a2a" : guide.status === "warning" ? "#f59f00" : "#2f6235"}
+            strokeWidth={Math.max(0.8, viewBox.width / 520)}
+            strokeDasharray={guide.status === "ok" ? "2 2" : "3 2"}
+            opacity={guide.status === "ok" ? 0.45 : 0.86}
+          />
+          {guide.status !== "ok" ? <GuideLabel guide={guide} textSize={textSize} /> : null}
+        </g>
+      ))}
+      {overlay.intersections.map((intersection) => (
+        <g key={intersection.id}>
+          <circle cx={intersection.position.x} cy={intersection.position.y} r={markerSize * 0.85} fill="#fff5f5" stroke="#c92a2a" strokeWidth={Math.max(0.8, viewBox.width / 520)} />
+          <line
+            x1={intersection.position.x - markerSize}
+            y1={intersection.position.y - markerSize}
+            x2={intersection.position.x + markerSize}
+            y2={intersection.position.y + markerSize}
+            stroke="#c92a2a"
+            strokeWidth={Math.max(0.9, viewBox.width / 470)}
+          />
+          <line
+            x1={intersection.position.x - markerSize}
+            y1={intersection.position.y + markerSize}
+            x2={intersection.position.x + markerSize}
+            y2={intersection.position.y - markerSize}
+            stroke="#c92a2a"
+            strokeWidth={Math.max(0.9, viewBox.width / 470)}
+          />
+          <text x={intersection.position.x + markerSize * 1.25} y={intersection.position.y - markerSize * 0.9} fill="#c92a2a" fontSize={textSize} fontWeight="800">
+            Kryds
+          </text>
+        </g>
+      ))}
+    </g>
+  );
+}
+
+function GuideLabel({ guide, textSize }: { guide: DistanceGuide; textSize: number }) {
+  const center = midpoint(guide.from, guide.to);
+  const width = Math.max(textSize * 8.5, guide.label.length * textSize * 0.55);
+  const height = textSize * 2.9;
+  const fill = guide.status === "error" ? "#fff5f5" : "#fff9db";
+  const stroke = guide.status === "error" ? "#c92a2a" : "#f59f00";
+
+  return (
+    <g>
+      <rect x={center.x + textSize * 0.8} y={center.y - height} width={width} height={height} rx={textSize * 0.35} fill={fill} stroke={stroke} strokeWidth={0.45} opacity={0.93} />
+      <text x={center.x + textSize * 1.45} y={center.y - height * 0.52} fill={stroke} fontSize={textSize} fontWeight="800">
+        {formatMeters(guide.distanceMeters, 1)}
+      </text>
     </g>
   );
 }
@@ -1735,6 +1895,260 @@ function ruleCheck(
     detail: matching.messageDa,
     position: matching.position ?? trackCenter(track),
     trackId: track.id
+  };
+}
+
+function buildRuleGuideOverlay(project: ProjectSnapshot, selectedTrackIds: string[], validation: ProjectValidationResult): RuleGuideOverlay {
+  const issueTrackIds = new Set(
+    [...validation.errors, ...validation.warnings]
+      .flatMap((message) => [message.trackId, message.relatedTrackId])
+      .filter((trackId): trackId is string => Boolean(trackId))
+  );
+  const selectedSet = new Set(selectedTrackIds);
+  let guideTrackIds = project.tracks.filter((track) => selectedSet.has(track.id)).map((track) => track.id);
+
+  if (guideTrackIds.length === 0) {
+    guideTrackIds = project.tracks.filter((track) => issueTrackIds.has(track.id)).map((track) => track.id);
+  }
+
+  if (guideTrackIds.length === 0 && project.tracks[0]) {
+    guideTrackIds = [project.tracks[0].id];
+  }
+
+  const guideTracks = project.tracks.filter((track) => guideTrackIds.includes(track.id));
+  const edgeGuides = guideTracks.flatMap((track) => {
+    const guide = edgeGuideForTrack(project, track);
+    return guide ? [guide] : [];
+  });
+  const trackGuides: DistanceGuide[] = [];
+  const intersections: IntersectionGuide[] = [];
+  const seenPairs = new Set<string>();
+
+  guideTracks.forEach((track) => {
+    project.tracks.forEach((otherTrack) => {
+      if (track.id === otherTrack.id) {
+        return;
+      }
+
+      const pairId = [track.id, otherTrack.id].sort().join("-");
+      if (seenPairs.has(pairId)) {
+        return;
+      }
+      seenPairs.add(pairId);
+
+      trackIntersectionPoints(track, otherTrack).slice(0, 4).forEach((position, index) => {
+        intersections.push({
+          id: `intersection-${pairId}-${index}`,
+          label: `${track.name} krydser ${otherTrack.name}`,
+          position,
+          trackId: track.id,
+          relatedTrackId: otherTrack.id
+        });
+      });
+
+      const connector = nearestConnectorBetweenPolylines(track.points, otherTrack.points);
+      if (!connector) {
+        return;
+      }
+
+      const requiredMeters = Math.max(
+        project.minimumTrackSpacingMeters,
+        rulesForTrack(project, track).minTrackSpacingMeters,
+        rulesForTrack(project, otherTrack).minTrackSpacingMeters
+      );
+      const crosses = trackIntersectionPoints(track, otherTrack).length > 0;
+
+      trackGuides.push({
+        id: `spacing-${pairId}`,
+        label: crosses ? `${track.name} krydser ${otherTrack.name}` : `${track.name} til ${otherTrack.name}`,
+        from: connector.from,
+        to: connector.to,
+        distanceMeters: connector.distanceMeters,
+        requiredMeters,
+        status: crosses ? "error" : clearanceStatus(connector.distanceMeters, requiredMeters),
+        trackId: track.id,
+        relatedTrackId: otherTrack.id
+      });
+    });
+  });
+
+  const errorCount =
+    intersections.length +
+    edgeGuides.filter((guide) => guide.status === "error").length +
+    trackGuides.filter((guide) => guide.status === "error").length;
+  const warningCount =
+    edgeGuides.filter((guide) => guide.status === "warning").length +
+    trackGuides.filter((guide) => guide.status === "warning").length;
+
+  return {
+    guideTrackIds,
+    edgeGuides,
+    trackGuides,
+    intersections,
+    errorCount,
+    warningCount
+  };
+}
+
+function edgeGuideForTrack(project: ProjectSnapshot, track: Track): DistanceGuide | undefined {
+  const connector = nearestConnectorToPolygon(track.points, project.field.polygon);
+  if (!connector) {
+    return undefined;
+  }
+
+  return {
+    id: `edge-${track.id}`,
+    label: `${track.name} til skel`,
+    from: connector.from,
+    to: connector.to,
+    distanceMeters: connector.distanceMeters,
+    requiredMeters: project.edgeMarginMeters,
+    status: clearanceStatus(connector.distanceMeters, project.edgeMarginMeters),
+    trackId: track.id
+  };
+}
+
+function clearanceStatus(distanceMeters: number, requiredMeters: number): RuleStatus {
+  if (distanceMeters + 1e-6 < requiredMeters) {
+    return "error";
+  }
+
+  if (distanceMeters < requiredMeters + Math.max(3, requiredMeters * 0.18)) {
+    return "warning";
+  }
+
+  return "ok";
+}
+
+function nearestConnectorToPolygon(points: Coordinate[], polygon: Coordinate[]): SegmentConnector | undefined {
+  let best: SegmentConnector | undefined;
+
+  for (let pointIndex = 0; pointIndex < points.length - 1; pointIndex += 1) {
+    for (let edgeIndex = 0; edgeIndex < polygon.length; edgeIndex += 1) {
+      const connector = nearestConnectorBetweenSegments(
+        points[pointIndex],
+        points[pointIndex + 1],
+        polygon[edgeIndex],
+        polygon[(edgeIndex + 1) % polygon.length]
+      );
+      if (!best || connector.distanceMeters < best.distanceMeters) {
+        best = connector;
+      }
+    }
+  }
+
+  return best;
+}
+
+type SegmentConnector = {
+  from: Coordinate;
+  to: Coordinate;
+  distanceMeters: number;
+};
+
+function nearestConnectorBetweenPolylines(a: Coordinate[], b: Coordinate[]): SegmentConnector | undefined {
+  let best: SegmentConnector | undefined;
+
+  for (let aIndex = 0; aIndex < a.length - 1; aIndex += 1) {
+    for (let bIndex = 0; bIndex < b.length - 1; bIndex += 1) {
+      const connector = nearestConnectorBetweenSegments(a[aIndex], a[aIndex + 1], b[bIndex], b[bIndex + 1]);
+      if (!best || connector.distanceMeters < best.distanceMeters) {
+        best = connector;
+      }
+    }
+  }
+
+  return best;
+}
+
+function nearestConnectorBetweenSegments(a1: Coordinate, a2: Coordinate, b1: Coordinate, b2: Coordinate): SegmentConnector {
+  if (segmentsIntersect(a1, a2, b1, b2)) {
+    const position = segmentIntersectionPoint(a1, a2, b1, b2);
+    return { from: position, to: position, distanceMeters: 0 };
+  }
+
+  const candidates = [
+    connectorFromPointToSegment(a1, b1, b2, "a"),
+    connectorFromPointToSegment(a2, b1, b2, "a"),
+    connectorFromPointToSegment(b1, a1, a2, "b"),
+    connectorFromPointToSegment(b2, a1, a2, "b")
+  ].sort((left, right) => left.distanceMeters - right.distanceMeters);
+  const measuredDistance = distanceBetweenSegments(a1, a2, b1, b2);
+
+  return { ...candidates[0], distanceMeters: measuredDistance };
+}
+
+function connectorFromPointToSegment(point: Coordinate, start: Coordinate, end: Coordinate, source: "a" | "b"): SegmentConnector {
+  const projected = nearestPointOnSegment(point, start, end);
+  return source === "a"
+    ? { from: point, to: projected, distanceMeters: distance(point, projected) }
+    : { from: projected, to: point, distanceMeters: distance(point, projected) };
+}
+
+function nearestPointOnSegment(point: Coordinate, start: Coordinate, end: Coordinate): Coordinate {
+  const segmentLengthSquared = (end.x - start.x) ** 2 + (end.y - start.y) ** 2;
+
+  if (segmentLengthSquared === 0) {
+    return start;
+  }
+
+  const t = Math.max(
+    0,
+    Math.min(
+      1,
+      ((point.x - start.x) * (end.x - start.x) + (point.y - start.y) * (end.y - start.y)) /
+        segmentLengthSquared
+    )
+  );
+
+  return {
+    x: start.x + (end.x - start.x) * t,
+    y: start.y + (end.y - start.y) * t
+  };
+}
+
+function trackIntersectionPoints(track: Track, otherTrack: Track): Coordinate[] {
+  const intersections: Coordinate[] = [];
+
+  for (let trackIndex = 0; trackIndex < track.points.length - 1; trackIndex += 1) {
+    for (let otherIndex = 0; otherIndex < otherTrack.points.length - 1; otherIndex += 1) {
+      const start = track.points[trackIndex];
+      const end = track.points[trackIndex + 1];
+      const otherStart = otherTrack.points[otherIndex];
+      const otherEnd = otherTrack.points[otherIndex + 1];
+      if (segmentsIntersect(start, end, otherStart, otherEnd)) {
+        intersections.push(segmentIntersectionPoint(start, end, otherStart, otherEnd));
+      }
+    }
+  }
+
+  return intersections;
+}
+
+function segmentIntersectionPoint(a1: Coordinate, a2: Coordinate, b1: Coordinate, b2: Coordinate): Coordinate {
+  const denominator = (a1.x - a2.x) * (b1.y - b2.y) - (a1.y - a2.y) * (b1.x - b2.x);
+
+  if (Math.abs(denominator) < 1e-9) {
+    return [a1, a2, b1, b2].find((point) => pointOnSegment(point, a1, a2) && pointOnSegment(point, b1, b2)) ?? midpoint(a1, b1);
+  }
+
+  const aCross = a1.x * a2.y - a1.y * a2.x;
+  const bCross = b1.x * b2.y - b1.y * b2.x;
+
+  return {
+    x: (aCross * (b1.x - b2.x) - (a1.x - a2.x) * bCross) / denominator,
+    y: (aCross * (b1.y - b2.y) - (a1.y - a2.y) * bCross) / denominator
+  };
+}
+
+function pointOnSegment(point: Coordinate, start: Coordinate, end: Coordinate): boolean {
+  return Math.abs(distance(start, point) + distance(point, end) - distance(start, end)) < 1e-5;
+}
+
+function midpoint(start: Coordinate, end: Coordinate): Coordinate {
+  return {
+    x: (start.x + end.x) / 2,
+    y: (start.y + end.y) / 2
   };
 }
 

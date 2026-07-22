@@ -43,6 +43,8 @@ npm run dev:next
 npm run build:next
 ```
 
+Preview-serveren har et health-endpoint på `/api/health`. Kør `npm run demo:check` for at starte en isoleret preview-server på en testport og kontrollere, at HTML og health-status svarer.
+
 I denne Codex-session har Next CLI-hovedstien hængt før første brugbare output, så preview-serveren er den aktuelle lokale feedbackflade.
 
 Hvis Prisma migrate-engine fejler lokalt, bruger `npm run db:migrate` den indcheckede idempotente SQLite-SQL direkte via `prisma db execute`.

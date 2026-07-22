@@ -7,6 +7,7 @@
     "dev:next": "next dev",
     "build": "node scripts/build-preview.mjs",
     "build:next": "next build",
+    "demo:check": "node scripts/check-preview.mjs",
     "start": "node scripts/dev-preview.mjs --no-watch",
     "lint": "node scripts/lint-source.mjs",
     "typecheck": "tsc -p tsconfig.geometry.json --noEmit --pretty false && tsc -p tsconfig.store.json --noEmit --pretty false && tsc -p tsconfig.project-repository.json --noEmit --pretty false && tsc -p tsconfig.schema.json --noEmit --pretty false && tsc -p tsconfig.ui.json --noEmit --pretty false && tsc -p tsconfig.api.json --noEmit --pretty false",

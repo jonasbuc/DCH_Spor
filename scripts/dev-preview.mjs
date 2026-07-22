@@ -70,6 +70,18 @@ async function handleRequest(request, response) {
   try {
     const url = new URL(request.url ?? "/", `http://${host}:${port}`);
 
+    if (url.pathname === "/api/health") {
+      sendJson(response, 200, {
+        success: true,
+        data: {
+          app: "DcH Sporplanlægger",
+          mode: "real-preview",
+          server: "ok"
+        }
+      });
+      return;
+    }
+
     if (url.pathname === "/api/geocode") {
       await geocode(url, response);
       return;
