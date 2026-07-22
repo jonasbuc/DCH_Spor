@@ -9,7 +9,7 @@ import { createInnerUsablePolygon } from "@/geometry/buffers";
 import { distanceBetweenTracks, nearestDistanceToBoundary, tracksIntersect } from "@/geometry/distances";
 import { autoPlaceTracks } from "@/geometry/placement/auto-placement";
 import { createMapReference, latLonToLocalMeters, localMetersToLatLon } from "@/geometry/map-projection";
-import { calculatePolygonArea } from "@/geometry/polygons";
+import { calculatePolygonArea, calculatePolygonPerimeter } from "@/geometry/polygons";
 import {
   calculateSegmentLengths,
   calculateTrackLength,
@@ -372,6 +372,88 @@ describe("validering og placering", () => {
     expect(result.placedTrackCount).toBe(4);
     expect(validateProject({ ...project, tracks: result.tracks }).valid).toBe(true);
     expect(result.tracks.every((track) => Math.abs(calculateTrackLength(track) - longerBTemplate.lengthMeters) < 0.001)).toBe(true);
+  });
+
+  it("kan autoplacere A- og E-spor intelligent på større marker", () => {
+    const aField = [
+      { x: 0, y: 0 },
+      { x: 900, y: 0 },
+      { x: 900, y: 650 },
+      { x: 0, y: 650 }
+    ];
+    const aFieldArea = calculatePolygonArea(aField);
+    const baseAProject = createDemoProject("auto-a");
+    const aProject = {
+      ...baseAProject,
+      template: dchATrackTemplate,
+      templates: [dchBTrackTemplate, dchATrackTemplate, dchETrackTemplate],
+      tracks: [],
+      edgeMarginMeters: 10,
+      minimumTrackSpacingMeters: dchATrackTemplate.minTrackSpacingMeters,
+      field: {
+        ...baseAProject.field,
+        polygon: aField,
+        areaM2: aFieldArea,
+        areaHa: aFieldArea / 10_000,
+        perimeterMeters: calculatePolygonPerimeter(aField)
+      },
+      restrictedAreas: []
+    };
+    const aResult = autoPlaceTracks(aProject, {
+      requestedTrackCount: 10,
+      edgeMarginMeters: 10,
+      minimumTrackSpacingMeters: dchATrackTemplate.minTrackSpacingMeters,
+      preferredDirectionDegrees: 20,
+      allowMirror: true,
+      alternateStartDirections: true,
+      placeInRows: false,
+      sameShape: false,
+      varySegmentLengths: true,
+      seed: 777
+    });
+
+    expect(aResult.placedTrackCount).toBe(10);
+    expect(validateProject({ ...aProject, tracks: aResult.tracks }).valid).toBe(true);
+
+    const eField = [
+      { x: 0, y: 0 },
+      { x: 1200, y: 0 },
+      { x: 1200, y: 900 },
+      { x: 0, y: 900 }
+    ];
+    const eFieldArea = calculatePolygonArea(eField);
+    const baseEProject = createDemoProject("auto-e");
+    const eProject = {
+      ...baseEProject,
+      template: dchETrackTemplate,
+      templates: [dchBTrackTemplate, dchATrackTemplate, dchETrackTemplate],
+      tracks: [],
+      edgeMarginMeters: 10,
+      minimumTrackSpacingMeters: dchETrackTemplate.minTrackSpacingMeters,
+      field: {
+        ...baseEProject.field,
+        polygon: eField,
+        areaM2: eFieldArea,
+        areaHa: eFieldArea / 10_000,
+        perimeterMeters: calculatePolygonPerimeter(eField)
+      },
+      restrictedAreas: []
+    };
+    const eResult = autoPlaceTracks(eProject, {
+      requestedTrackCount: 6,
+      edgeMarginMeters: 10,
+      minimumTrackSpacingMeters: dchETrackTemplate.minTrackSpacingMeters,
+      preferredDirectionDegrees: 25,
+      allowMirror: true,
+      alternateStartDirections: true,
+      placeInRows: false,
+      sameShape: false,
+      varySegmentLengths: true,
+      seed: 777
+    });
+
+    expect(eResult.placedTrackCount).toBe(6);
+    expect(validateProject({ ...eProject, tracks: eResult.tracks }).valid).toBe(true);
   });
 
   it("kan placere nye spor uden om eksisterende faste spor", () => {
