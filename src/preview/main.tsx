@@ -93,6 +93,8 @@ type TrackProfile = {
 type EditorDragState =
   | { type: "track"; trackId: string; last: Coordinate }
   | { type: "pan"; lastClientX: number; lastClientY: number }
+  | { type: "rotate"; trackIds: string[]; origin: Coordinate; startAngleDegrees: number; initialTracks: Track[] }
+  | { type: "object"; trackId: string; objectId: string }
   | null;
 
 const trackProfiles: TrackProfile[] = [
@@ -156,6 +158,9 @@ function PreviewApp() {
   const [showIssueLabels, setShowIssueLabels] = useState(false);
   const [focusTarget, setFocusTarget] = useState<FocusTarget>(null);
   const [lastPlacementReport, setLastPlacementReport] = useState<PlacementReport | null>(null);
+  const [measurePoints, setMeasurePoints] = useState<Coordinate[]>([]);
+  const [measureCursor, setMeasureCursor] = useState<Coordinate | null>(null);
+  const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const requestedTrackCountRef = useRef<HTMLInputElement | null>(null);
 
@@ -173,6 +178,11 @@ function PreviewApp() {
     () => buildRuleGuideOverlay(project, selectedTrackIds, validation),
     [project, selectedTrackIds, validation]
   );
+  const activeMeasurement = useMemo(() => {
+    const start = measurePoints[0];
+    const end = measurePoints[1] ?? measureCursor;
+    return start && end ? { start, end, distanceMeters: distance(start, end) } : null;
+  }, [measureCursor, measurePoints]);
 
   function commit(next: ProjectSnapshot, text = "Ændring gemt i preview-state") {
     setProject({ ...next, templates: next.templates ?? dchTrackTemplates, updatedAt: new Date().toISOString(), version: next.version + 1 });
@@ -198,6 +208,7 @@ function PreviewApp() {
   }
 
   function selectTrack(trackId: string, additive = false) {
+    setSelectedObjectId(null);
     setSelectedTrackIds((current) => {
       if (!additive) return [trackId];
       return current.includes(trackId) ? current.filter((id) => id !== trackId) : [...current, trackId];
@@ -221,6 +232,66 @@ function PreviewApp() {
 
   function rotateSelectedBy(angleDegrees: number) {
     transformSelected((track) => rotateTrack(track, angleDegrees, trackCenter(track)), `Markerede spor roteret ${angleDegrees.toFixed(1)}°`);
+  }
+
+  function startRotationDrag(event: React.PointerEvent<SVGCircleElement>, trackId: string) {
+    event.preventDefault();
+    event.stopPropagation();
+    svgRef.current?.setPointerCapture(event.pointerId);
+    const trackIds = selectedTrackIds.includes(trackId) ? selectedIds() : [trackId];
+    const initialTracks = project.tracks.filter((track) => trackIds.includes(track.id));
+
+    if (initialTracks.length === 0) {
+      return;
+    }
+
+    const origin = centerOfTracks(initialTracks);
+    setSelectedTrackIds(trackIds);
+    setDragging({
+      type: "rotate",
+      trackIds,
+      origin,
+      startAngleDegrees: angleFrom(origin, toWorld(event)),
+      initialTracks
+    });
+    setStage(`${trackIds.length} spor klar til rotation`);
+  }
+
+  function startObjectDrag(event: React.PointerEvent<SVGGElement>, trackId: string, objectId: string) {
+    if (tool === "measure" || tool === "pan") {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    svgRef.current?.setPointerCapture(event.pointerId);
+    setSelectedTrackIds([trackId]);
+    setSelectedObjectId(objectId);
+    setDragging({ type: "object", trackId, objectId });
+    setStage("Træk genstanden langs sporet");
+  }
+
+  function updateObjectDistance(trackId: string, objectId: string, distanceMeters: number, text = "Genstand flyttet") {
+    const track = project.tracks.find((candidate) => candidate.id === trackId);
+    const clampedDistance = Math.max(0, Math.min(calculateTrackLength(track ?? { points: [] }), distanceMeters));
+
+    commit(
+      {
+        ...project,
+        tracks: project.tracks.map((candidate) =>
+          candidate.id === trackId
+            ? {
+                ...candidate,
+                objects: candidate.objects.map((object) =>
+                  object.id === objectId ? { ...object, distanceAlongTrackMeters: clampedDistance } : object
+                )
+              }
+            : candidate
+        )
+      },
+      text
+    );
+    setSelectedObjectId(objectId);
   }
 
   function addTrack() {
@@ -651,7 +722,26 @@ function PreviewApp() {
     downloadBlob(content, `${project.name}.${extension}`, type);
   }
 
+  function addMeasurePoint(point: Coordinate) {
+    const nextPoints = measurePoints.length >= 2 ? [point] : [...measurePoints, point];
+    setMeasurePoints(nextPoints);
+    setMeasureCursor(point);
+    setStage(nextPoints.length === 2 ? `Målt afstand: ${formatMeters(distance(nextPoints[0], nextPoints[1]), 1)}` : "Målepunkt sat");
+  }
+
+  function clearMeasurement() {
+    setMeasurePoints([]);
+    setMeasureCursor(null);
+    setStage("Måling nulstillet");
+  }
+
   function onPointerMove(event: React.PointerEvent<SVGSVGElement>) {
+    const point = toWorld(event);
+
+    if (tool === "measure" && measurePoints.length === 1) {
+      setMeasureCursor(point);
+    }
+
     if (!dragging) return;
 
     if (dragging.type === "pan") {
@@ -665,7 +755,48 @@ function PreviewApp() {
       return;
     }
 
-    const point = toWorld(event);
+    if (dragging.type === "rotate") {
+      const deltaDegrees = signedAngleDelta(dragging.startAngleDegrees, angleFrom(dragging.origin, point));
+      const initialById = new Map(dragging.initialTracks.map((track) => [track.id, track]));
+      setProject((current) => ({
+        ...current,
+        updatedAt: new Date().toISOString(),
+        tracks: current.tracks.map((track) => {
+          const initial = initialById.get(track.id);
+          return initial ? rotateTrack(initial, deltaDegrees, dragging.origin) : track;
+        })
+      }));
+      setStage(`Roterer ${formatSignedDegrees(deltaDegrees)}`);
+      return;
+    }
+
+    if (dragging.type === "object") {
+      setProject((current) => {
+        const track = current.tracks.find((candidate) => candidate.id === dragging.trackId);
+        if (!track) {
+          return current;
+        }
+        const distanceAlongTrackMeters = nearestDistanceAlongTrack(track.points, point);
+
+        return {
+          ...current,
+          updatedAt: new Date().toISOString(),
+          tracks: current.tracks.map((candidate) =>
+            candidate.id === dragging.trackId
+              ? {
+                  ...candidate,
+                  objects: candidate.objects.map((object) =>
+                    object.id === dragging.objectId ? { ...object, distanceAlongTrackMeters } : object
+                  )
+                }
+              : candidate
+          )
+        };
+      });
+      setStage("Genstand flyttes langs sporet");
+      return;
+    }
+
     const dx = point.x - dragging.last.x;
     const dy = point.y - dragging.last.y;
     setDragging({ ...dragging, last: point });
@@ -675,6 +806,28 @@ function PreviewApp() {
       updatedAt: new Date().toISOString(),
       tracks: current.tracks.map((track) => (ids.includes(track.id) ? translateTrack(track, dx, dy) : track))
     }));
+  }
+
+  function finishPointerDrag() {
+    if (dragging?.type === "track") {
+      setSaveStatus("Ikke gemt");
+      setStage("Spor flyttet");
+      window.setTimeout(() => setSaveStatus("Gemt"), 450);
+    }
+
+    if (dragging?.type === "rotate") {
+      setSaveStatus("Ikke gemt");
+      setStage("Spor roteret med håndtag");
+      window.setTimeout(() => setSaveStatus("Gemt"), 450);
+    }
+
+    if (dragging?.type === "object") {
+      setSaveStatus("Ikke gemt");
+      setStage("Genstand flyttet");
+      window.setTimeout(() => setSaveStatus("Gemt"), 450);
+    }
+
+    setDragging(null);
   }
 
   function zoomAt(factor: number, anchor: Coordinate) {
@@ -923,6 +1076,10 @@ function PreviewApp() {
               <button className={tool === "pan" ? "primary" : ""} onClick={() => setTool("pan")}>
                 Pan
               </button>
+              <button className={tool === "measure" ? "primary" : ""} onClick={() => setTool("measure")}>
+                Mål
+              </button>
+              {measurePoints.length > 0 ? <button onClick={clearMeasurement}>Ryd mål</button> : null}
               <button onClick={() => zoomCenter(0.82)}>+</button>
               <button onClick={() => zoomCenter(1.22)}>-</button>
               <button onClick={() => setViewBox(viewBoxForPoints(project.field.polygon, 18))}>Fit mark</button>
@@ -951,13 +1108,18 @@ function PreviewApp() {
                 zoomAt(event.deltaY < 0 ? 0.88 : 1.14, toWorld(event));
               }}
               onPointerDown={(event) => {
+                if (tool === "measure") {
+                  addMeasurePoint(toWorld(event));
+                  return;
+                }
                 if (tool === "pan") {
+                  svgRef.current?.setPointerCapture(event.pointerId);
                   setDragging({ type: "pan", lastClientX: event.clientX, lastClientY: event.clientY });
                 }
               }}
               onPointerMove={onPointerMove}
-              onPointerUp={() => setDragging(null)}
-              onPointerLeave={() => setDragging(null)}
+              onPointerUp={finishPointerDrag}
+              onPointerLeave={finishPointerDrag}
             >
               {project.field.backgroundImage ? <BackgroundImage image={project.field.backgroundImage} /> : null}
               <polygon points={project.field.polygon.map(pointToSvg).join(" ")} fill="#d9eed9" stroke="#2f6235" strokeWidth={1.6} opacity={0.86} />
@@ -976,14 +1138,21 @@ function PreviewApp() {
                   key={track.id}
                   track={track}
                   selected={selectedTrackIds.includes(track.id)}
+                  selectedObjectId={selectedObjectId}
+                  viewBox={viewBox}
+                  onRotatePointerDown={startRotationDrag}
+                  onObjectPointerDown={startObjectDrag}
                   onPointerDown={(event) => {
                     if (tool === "pan") return;
+                    if (tool === "measure") return;
                     event.stopPropagation();
+                    svgRef.current?.setPointerCapture(event.pointerId);
                     selectTrack(track.id, event.shiftKey || event.metaKey || event.ctrlKey);
                     setDragging({ type: "track", trackId: track.id, last: toWorld(event) });
                   }}
                 />
               ))}
+              <MeasureOverlay measurement={activeMeasurement} points={measurePoints} viewBox={viewBox} />
               {focusTarget ? <FocusMarker target={focusTarget} viewBox={viewBox} /> : null}
               {showIssueLabels ? <IssueLabels messages={messages} /> : null}
               <ScaleBar viewBox={viewBox} />
@@ -1057,6 +1226,28 @@ function PreviewApp() {
                 </button>
               ))}
             </div>
+            <div className="measure-card">
+              <div className="toolbar">
+                <strong>Måling</strong>
+                <span>{activeMeasurement ? formatMeters(activeMeasurement.distanceMeters, 1) : "-"}</span>
+              </div>
+              <div className="two">
+                <button className={tool === "measure" ? "primary" : ""} onClick={() => setTool("measure")}>
+                  Mål
+                </button>
+                <button onClick={clearMeasurement}>Ryd</button>
+              </div>
+            </div>
+            {selectedTrack ? (
+              <ObjectEditor
+                track={selectedTrack}
+                selectedObjectId={selectedObjectId}
+                onSelect={setSelectedObjectId}
+                onChangeDistance={(objectId, distanceMeters) =>
+                  updateObjectDistance(selectedTrack.id, objectId, distanceMeters, `Genstand flyttet til ${formatMeters(distanceMeters, 1)}`)
+                }
+              />
+            ) : null}
           </section>
 
           <section className="section stack">
@@ -1128,7 +1319,23 @@ function PreviewApp() {
   );
 }
 
-function TrackSvg({ track, selected, onPointerDown }: { track: Track; selected: boolean; onPointerDown: (event: React.PointerEvent<SVGGElement>) => void }) {
+function TrackSvg({
+  track,
+  selected,
+  selectedObjectId,
+  viewBox,
+  onPointerDown,
+  onRotatePointerDown,
+  onObjectPointerDown
+}: {
+  track: Track;
+  selected: boolean;
+  selectedObjectId: string | null;
+  viewBox: ViewBoxState;
+  onPointerDown: (event: React.PointerEvent<SVGGElement>) => void;
+  onRotatePointerDown: (event: React.PointerEvent<SVGCircleElement>, trackId: string) => void;
+  onObjectPointerDown: (event: React.PointerEvent<SVGGElement>, trackId: string, objectId: string) => void;
+}) {
   return (
     <g onPointerDown={onPointerDown}>
       <polyline
@@ -1154,15 +1361,116 @@ function TrackSvg({ track, selected, onPointerDown }: { track: Track; selected: 
       </text>
       {track.objects.map((object) => {
         const position = coordinateAtDistance(track.points, object.distanceAlongTrackMeters);
+        const objectSelected = selected && selectedObjectId === object.id;
         return (
-          <g key={object.id}>
-            <circle cx={position.x} cy={position.y} r={2.5} fill="#fff" stroke={track.color} strokeWidth={1} />
-            <text x={position.x + 2.8} y={position.y - 2.8} fill="#16201b" fontSize="4">
+          <g key={object.id} className="object-handle" onPointerDown={(event) => onObjectPointerDown(event, track.id, object.id)}>
+            <circle
+              cx={position.x}
+              cy={position.y}
+              r={objectSelected ? 3.7 : 2.7}
+              fill="#fff"
+              stroke={objectSelected ? "#16201b" : track.color}
+              strokeWidth={objectSelected ? 1.4 : 1}
+            />
+            <text x={position.x + 2.8} y={position.y - 2.8} fill="#16201b" fontSize="4" fontWeight={objectSelected ? "800" : "500"}>
               G{object.displayNo}
             </text>
           </g>
         );
       })}
+      {selected ? <RotationHandle track={track} viewBox={viewBox} onPointerDown={onRotatePointerDown} /> : null}
+    </g>
+  );
+}
+
+function RotationHandle({
+  track,
+  viewBox,
+  onPointerDown
+}: {
+  track: Track;
+  viewBox: ViewBoxState;
+  onPointerDown: (event: React.PointerEvent<SVGCircleElement>, trackId: string) => void;
+}) {
+  const center = trackCenter(track);
+  const handle = rotationHandlePosition(track, viewBox);
+  const radius = Math.max(3.4, viewBox.width / 112);
+  const strokeWidth = Math.max(0.9, viewBox.width / 520);
+
+  return (
+    <g className="rotation-handle" pointerEvents="all">
+      <line x1={center.x} y1={center.y} x2={handle.x} y2={handle.y} stroke="#16201b" strokeWidth={strokeWidth} strokeDasharray="2 2" opacity={0.72} />
+      <circle
+        cx={handle.x}
+        cy={handle.y}
+        r={radius * 1.85}
+        fill="#ffffff"
+        stroke="#16201b"
+        strokeWidth={strokeWidth}
+        onPointerDown={(event) => onPointerDown(event, track.id)}
+      />
+      <circle cx={handle.x} cy={handle.y} r={radius * 0.72} fill={track.color} pointerEvents="none" />
+      <text x={handle.x} y={handle.y - radius * 2.15} textAnchor="middle" fill="#16201b" fontSize={radius * 1.25} fontWeight="800" pointerEvents="none">
+        R
+      </text>
+    </g>
+  );
+}
+
+function MeasureOverlay({
+  measurement,
+  points,
+  viewBox
+}: {
+  measurement: { start: Coordinate; end: Coordinate; distanceMeters: number } | null;
+  points: Coordinate[];
+  viewBox: ViewBoxState;
+}) {
+  const radius = Math.max(3.3, viewBox.width / 120);
+  const textSize = Math.max(4.5, viewBox.width / 86);
+
+  if (points.length === 0) {
+    return null;
+  }
+
+  return (
+    <g pointerEvents="none">
+      {measurement ? (
+        <>
+          <line
+            x1={measurement.start.x}
+            y1={measurement.start.y}
+            x2={measurement.end.x}
+            y2={measurement.end.y}
+            stroke="#0b7285"
+            strokeWidth={Math.max(1, viewBox.width / 460)}
+            strokeDasharray="4 2"
+          />
+          <MeasureLabel measurement={measurement} textSize={textSize} />
+        </>
+      ) : null}
+      {points.map((point, index) => (
+        <g key={`measure-point-${index}`}>
+          <circle cx={point.x} cy={point.y} r={radius} fill="#ffffff" stroke="#0b7285" strokeWidth={Math.max(0.9, viewBox.width / 520)} />
+          <circle cx={point.x} cy={point.y} r={radius * 0.38} fill="#0b7285" />
+        </g>
+      ))}
+    </g>
+  );
+}
+
+function MeasureLabel({ measurement, textSize }: { measurement: { start: Coordinate; end: Coordinate; distanceMeters: number }; textSize: number }) {
+  const center = midpoint(measurement.start, measurement.end);
+  const label = formatMeters(measurement.distanceMeters, 1);
+  const width = Math.max(textSize * 9, label.length * textSize * 0.75);
+  const height = textSize * 3.2;
+
+  return (
+    <g>
+      <rect x={center.x - width / 2} y={center.y - height - textSize * 0.55} width={width} height={height} rx={textSize * 0.42} fill="#e7f5ff" stroke="#0b7285" strokeWidth={0.5} opacity={0.94} />
+      <text x={center.x} y={center.y - height * 0.58} textAnchor="middle" fill="#0b7285" fontSize={textSize} fontWeight="800">
+        {label}
+      </text>
     </g>
   );
 }
@@ -1268,6 +1576,65 @@ function RuleGuidePanel({ overlay, onFocus }: { overlay: RuleGuideOverlay; onFoc
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function ObjectEditor({
+  track,
+  selectedObjectId,
+  onSelect,
+  onChangeDistance
+}: {
+  track: Track;
+  selectedObjectId: string | null;
+  onSelect: (objectId: string) => void;
+  onChangeDistance: (objectId: string, distanceMeters: number) => void;
+}) {
+  const lengthMeters = calculateTrackLength(track);
+
+  return (
+    <div className="object-card">
+      <div className="toolbar">
+        <strong>Genstande</strong>
+        <span className="small">{track.objects.length} stk.</span>
+      </div>
+      <div className="stack">
+        {track.objects.map((object) => {
+          const selected = object.id === selectedObjectId;
+          const distanceMeters = Math.max(0, Math.min(lengthMeters, object.distanceAlongTrackMeters));
+
+          return (
+            <div key={object.id} className={`object-row ${selected ? "active" : ""}`}>
+              <button onClick={() => onSelect(object.id)}>
+                G{object.displayNo}
+                {object.marksFinish ? " · slut" : ""}
+              </button>
+              <label>
+                Afstand
+                <input
+                  type="number"
+                  min="0"
+                  max={Math.ceil(lengthMeters)}
+                  step="0.5"
+                  value={Number(distanceMeters.toFixed(1))}
+                  onChange={(event) => onChangeDistance(object.id, Number(event.currentTarget.value))}
+                />
+              </label>
+              <input
+                aria-label={`G${object.displayNo} afstand`}
+                type="range"
+                min="0"
+                max={Math.max(1, Math.ceil(lengthMeters))}
+                step="0.5"
+                value={distanceMeters}
+                onChange={(event) => onChangeDistance(object.id, Number(event.currentTarget.value))}
+              />
+              {object.marksFinish ? <button onClick={() => onChangeDistance(object.id, lengthMeters)}>Til slut</button> : null}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1746,6 +2113,10 @@ function signedAngleDelta(fromDegrees: number, toDegrees: number): number {
   return ((((toDegrees - fromDegrees) % 360) + 540) % 360) - 180;
 }
 
+function angleFrom(origin: Coordinate, point: Coordinate): number {
+  return (Math.atan2(point.y - origin.y, point.x - origin.x) * 180) / Math.PI;
+}
+
 function formatDegrees(value: number): string {
   return `${Number(normalizeDegrees(value).toFixed(1))}°`;
 }
@@ -2107,6 +2478,36 @@ function nearestPointOnSegment(point: Coordinate, start: Coordinate, end: Coordi
   };
 }
 
+function nearestDistanceAlongTrack(points: Coordinate[], point: Coordinate): number {
+  let best = { distanceToTrack: Number.POSITIVE_INFINITY, distanceAlongTrackMeters: 0 };
+  let traversed = 0;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const start = points[index];
+    const end = points[index + 1];
+    const segmentLength = distance(start, end);
+
+    if (segmentLength === 0) {
+      continue;
+    }
+
+    const projected = nearestPointOnSegment(point, start, end);
+    const distanceToTrack = distance(point, projected);
+    const distanceOnSegment = distance(start, projected);
+
+    if (distanceToTrack < best.distanceToTrack) {
+      best = {
+        distanceToTrack,
+        distanceAlongTrackMeters: traversed + distanceOnSegment
+      };
+    }
+
+    traversed += segmentLength;
+  }
+
+  return Math.max(0, Math.min(traversed, best.distanceAlongTrackMeters));
+}
+
 function trackIntersectionPoints(track: Track, otherTrack: Track): Coordinate[] {
   const intersections: Coordinate[] = [];
 
@@ -2199,6 +2600,31 @@ function trackCenter(track: Track): Coordinate {
     y: 0
   });
   return { x: sum.x / track.points.length, y: sum.y / track.points.length };
+}
+
+function centerOfTracks(tracks: Track[]): Coordinate {
+  const centers = tracks.map(trackCenter);
+  const sum = centers.reduce((accumulator, point) => ({ x: accumulator.x + point.x, y: accumulator.y + point.y }), {
+    x: 0,
+    y: 0
+  });
+  return {
+    x: sum.x / Math.max(1, centers.length),
+    y: sum.y / Math.max(1, centers.length)
+  };
+}
+
+function rotationHandlePosition(track: Track, viewBox: ViewBoxState): Coordinate {
+  const center = trackCenter(track);
+  const first = track.points[0];
+  const second = track.points[1] ?? { x: first.x + 1, y: first.y };
+  const heading = Math.atan2(second.y - first.y, second.x - first.x);
+  const armLength = Math.max(14, Math.min(34, viewBox.width / 13));
+
+  return {
+    x: center.x + Math.cos(heading - Math.PI / 2) * armLength,
+    y: center.y + Math.sin(heading - Math.PI / 2) * armLength
+  };
 }
 
 function projectWithMeasuredTracks(project: ProjectSnapshot): ProjectSnapshot {

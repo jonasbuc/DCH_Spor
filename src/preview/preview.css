@@ -295,7 +295,19 @@ h3 {
   background: var(--field-soft);
 }
 
+.rotation-handle,
+.object-handle {
+  cursor: grab;
+}
+
+.rotation-handle:active,
+.object-handle:active {
+  cursor: grabbing;
+}
+
 .mix-panel,
+.measure-card,
+.object-card,
 .placement-summary,
 .rule-guide-card,
 .rule-summary {
@@ -350,6 +362,38 @@ h3 {
 .rule-guide-card {
   display: grid;
   gap: 8px;
+}
+
+.measure-card,
+.object-card {
+  display: grid;
+  gap: 9px;
+  background: #f8fbff;
+}
+
+.object-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr);
+  align-items: end;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  padding: 8px;
+}
+
+.object-row.active {
+  border-color: var(--field);
+  background: var(--field-soft);
+}
+
+.object-row input[type="range"] {
+  grid-column: 1 / -1;
+  padding: 0;
+}
+
+.object-row > button:last-child {
+  grid-column: 1 / -1;
 }
 
 .guide-row {
