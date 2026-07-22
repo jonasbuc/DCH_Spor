@@ -52,9 +52,11 @@ type PlacementReport = {
   result: ReturnType<typeof autoPlaceTracks>;
   mode: "requested" | "maximum" | "mixed";
   directionDegrees: number;
+  layoutMode: PlacementLayoutMode;
   triedDirections: number[];
   summary: string;
 };
+type PlacementLayoutMode = "rows" | "free";
 type PlacementInsight = {
   trackId: string;
   name: string;
@@ -174,6 +176,7 @@ function PreviewApp() {
   const [rotationNudgeDegrees, setRotationNudgeDegrees] = useState(2.5);
   const [autoDirectionDegrees, setAutoDirectionDegrees] = useState(0);
   const [autoKeepExisting, setAutoKeepExisting] = useState(false);
+  const [requestedTrackCountInput, setRequestedTrackCountInput] = useState(createDemoProject("preview-project").requestedTrackCount);
   const [mixedCounts, setMixedCounts] = useState<Record<string, number>>({ DCH_B: 2, DCH_A: 0, DCH_E: 0 });
   const [activeTemplateCode, setActiveTemplateCode] = useState("DCH_B");
   const [viewBox, setViewBox] = useState<ViewBoxState>(() => viewBoxForProject(createDemoProject("preview-project")));
@@ -195,6 +198,9 @@ function PreviewApp() {
   const capacityEstimates = useMemo(() => estimateTrackCapacities(project), [project]);
   const activeCapacityEstimate = capacityEstimates.find((estimate) => estimate.code === activeTemplateCode) ?? capacityEstimates[0];
   const suggestedTrackCount = activeCapacityEstimate?.suggestedTrackCount ?? estimateTrackCapacity(project, activeProfile.template);
+  const capacityWarning = activeCapacityEstimate
+    ? capacityWarningForRequest(requestedTrackCountInput, activeCapacityEstimate)
+    : undefined;
   const fieldAngleDegrees = fieldPrimaryAngle(project.field.polygon);
   const selectedTrackRuleChecks = useMemo(
     () => (selectedTrack ? buildTrackRuleChecks(project, selectedTrack, validation) : []),
@@ -379,7 +385,8 @@ function PreviewApp() {
     requestedTrackCount: number,
     fixedTracks: Track[],
     directionDegrees: number,
-    template: TrackTemplateRules
+    template: TrackTemplateRules,
+    layoutMode: PlacementLayoutMode
   ): PlacementOptions {
     return {
       requestedTrackCount,
@@ -389,7 +396,7 @@ function PreviewApp() {
       preferredDirectionDegrees: directionDegrees,
       allowMirror: true,
       alternateStartDirections: true,
-      placeInRows: true,
+      placeInRows: layoutMode === "rows",
       sameShape: false,
       varySegmentLengths: true,
       seed: 42
@@ -402,25 +409,48 @@ function PreviewApp() {
     fixedTracks: Track[],
     mode: PlacementReport["mode"]
   ): PlacementReport {
-    const directions = uniqueDirections([autoDirectionDegrees, fieldAngleDegrees, 0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165]);
-    const attempts = directions.map((directionDegrees) => {
-      const result = autoPlaceTracks(placementProject, createPlacementOptions(requestedTrackCount, fixedTracks, directionDegrees, placementProject.template));
-      return { result, directionDegrees };
-    });
+    const directions = directionsForTemplate(placementProject.template, autoDirectionDegrees, fieldAngleDegrees);
+    const layoutModes = layoutModesForTemplate(placementProject.template);
+    const attempts: { result: ReturnType<typeof autoPlaceTracks>; directionDegrees: number; layoutMode: PlacementLayoutMode }[] = [];
+
+    for (const layoutMode of layoutModes) {
+      for (const directionDegrees of directions) {
+        const result = autoPlaceTracks(
+          placementProject,
+          createPlacementOptions(requestedTrackCount, fixedTracks, directionDegrees, placementProject.template, layoutMode)
+        );
+        attempts.push({ result, directionDegrees, layoutMode });
+
+        if (mode !== "maximum" && result.placedTrackCount >= requestedTrackCount) {
+          break;
+        }
+      }
+
+      if (mode !== "maximum" && attempts.some((attempt) => attempt.result.placedTrackCount >= requestedTrackCount)) {
+        break;
+      }
+    }
+
     const best = attempts.sort((a, b) => {
       if (b.result.placedTrackCount !== a.result.placedTrackCount) {
         return b.result.placedTrackCount - a.result.placedTrackCount;
       }
+      if (a.layoutMode !== b.layoutMode && placementProject.template.turnCount > 2) {
+        return a.layoutMode === "free" ? -1 : 1;
+      }
       return b.result.score - a.result.score;
     })[0];
     const rejectedSummary = summarizeRejectedReasons(best.result.rejectedReasons);
+    const shortfallSummary = placementShortfallSummary(best.result, placementProject);
+    const layoutSummary = best.layoutMode === "free" ? "Fri fit valgt til langt spor" : "Række-fit valgt";
 
     return {
       result: { ...best.result, tracks: relabelTracks(best.result.tracks) },
       mode,
       directionDegrees: best.directionDegrees,
+      layoutMode: best.layoutMode,
       triedDirections: directions,
-      summary: rejectedSummary || "Alle valgte spor kunne placeres uden regelbrud."
+      summary: [layoutSummary, rejectedSummary || shortfallSummary || "Alle valgte spor kunne placeres uden regelbrud."].join(" · ")
     };
   }
 
@@ -434,7 +464,7 @@ function PreviewApp() {
 
   function runAutoPlacement(mode: "requested" | "maximum" = "requested") {
     const requestedTrackCount =
-      mode === "maximum" ? 1000 : normalizeTrackCount(Number(requestedTrackCountRef.current?.value ?? project.requestedTrackCount));
+      mode === "maximum" ? 1000 : normalizeTrackCount(requestedTrackCountInput);
     const fixedTracks = autoKeepExisting ? project.tracks : [];
     const placementProject = withActiveTemplate({ ...project, requestedTrackCount }, activeProfile.template);
     setStage(mode === "maximum" ? "Finder maks antal lovlige spor ..." : "Automatisk placering prøver flere retninger ...");
@@ -486,6 +516,7 @@ function PreviewApp() {
         },
         mode: "mixed",
         directionDegrees: autoDirectionDegrees,
+        layoutMode: activeProfile.template.turnCount > 2 ? "free" : "rows",
         triedDirections: [],
         summary: reports.join(" · ")
       };
@@ -654,6 +685,43 @@ function PreviewApp() {
     commit(next, `Mark roteret ${angleDegrees.toFixed(1)}°`);
     setPolygonInput(formatPolygonInput(next.field.polygon));
     setPolygonStatus(`${next.field.polygon.length} punkter · ${formatSquareMeters(next.field.areaM2)} · ${formatHectares(next.field.areaM2)} · roteret`);
+    setViewBox(viewBoxForProject(next));
+  }
+
+  function applyFieldPreset(widthMeters: number, heightMeters: number, name: string) {
+    const polygon = [
+      { x: 0, y: 0 },
+      { x: widthMeters, y: 0 },
+      { x: widthMeters, y: heightMeters },
+      { x: 0, y: heightMeters }
+    ];
+    const areaM2 = calculatePolygonArea(polygon);
+    const next = {
+      ...project,
+      field: {
+        ...project.field,
+        name,
+        sourceType: "image" as const,
+        polygon,
+        areaM2,
+        areaHa: areaM2 / 10_000,
+        perimeterMeters: calculatePolygonPerimeter(polygon),
+        backgroundImage: undefined,
+        calibration: {
+          method: "dimensions" as const,
+          meterPerPixel: 1,
+          knownWidthMeters: widthMeters,
+          knownHeightMeters: heightMeters,
+          calculatedAreaM2: areaM2,
+          deviationPercent: 0
+        }
+      },
+      restrictedAreas: []
+    };
+
+    commit(next, `${name} oprettet (${formatSquareMeters(areaM2)})`);
+    setPolygonInput(formatPolygonInput(polygon));
+    setPolygonStatus(`${name}: ${formatSquareMeters(areaM2)} · ${formatHectares(areaM2)} · klar til A/E-autoplacering`);
     setViewBox(viewBoxForProject(next));
   }
 
@@ -977,6 +1045,10 @@ function PreviewApp() {
               <button onClick={() => setAutoDirectionDegrees(fieldAngleDegrees)}>Brug markretning</button>
               <button onClick={saveFieldVariant}>Gem markvariant</button>
             </div>
+            <div className="two">
+              <button onClick={() => applyFieldPreset(900, 650, "Stor A/E-testmark")}>Stor A/E-mark</button>
+              <button onClick={() => applyFieldPreset(1400, 1000, "Ekstra stor Elite-testmark")}>Elite-testmark</button>
+            </div>
             <label>
               Markrotationstrin
               <input
@@ -1027,9 +1099,11 @@ function PreviewApp() {
                 type="number"
                 min="1"
                 max="1000"
-                defaultValue={project.requestedTrackCount}
+                value={requestedTrackCountInput}
+                onChange={(event) => setRequestedTrackCountInput(normalizeTrackCount(Number(event.currentTarget.value)))}
               />
             </label>
+            {capacityWarning ? <div className={`message ${capacityWarning.status}`}>{capacityWarning.text}</div> : null}
             <div className="metric">
               <span>Forslag ud fra markareal</span>
               <strong>{suggestedTrackCount} spor</strong>
@@ -1047,6 +1121,7 @@ function PreviewApp() {
                   if (requestedTrackCountRef.current) {
                     requestedTrackCountRef.current.value = String(suggestedTrackCount);
                   }
+                  setRequestedTrackCountInput(suggestedTrackCount);
                   setStage(`Forslag sat til ${suggestedTrackCount} spor`);
                 }}
               >
@@ -1620,7 +1695,7 @@ function PlacementSummary({ report, insights }: { report: PlacementReport; insig
     <div className="placement-summary">
       <div className="toolbar">
         <strong>{report.mode === "maximum" ? "Maksforslag" : report.mode === "mixed" ? "Mixforslag" : "Autoforslag"}</strong>
-        <span>{formatDegrees(report.directionDegrees)}</span>
+        <span>{formatDegrees(report.directionDegrees)} · {report.layoutMode === "free" ? "fri fit" : "rækker"}</span>
       </div>
       <p>
         {report.result.placedTrackCount}/{report.result.requestedTrackCount} nye spor · {report.result.tracks.length} i planen
@@ -2331,7 +2406,48 @@ function formatSignedDegrees(value: number): string {
 }
 
 function uniqueDirections(values: number[]): number[] {
-  return [...new Set(values.map((value) => normalizeDegrees(Math.round(value))))];
+  return [...new Set(values.map((value) => normalizeDegrees(Math.round(value * 2) / 2)))];
+}
+
+function directionsForTemplate(template: TrackTemplateRules, autoDirectionDegrees: number, fieldAngleDegrees: number): number[] {
+  const increments = template.turnCount > 2
+    ? [0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5]
+    : [0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165];
+  return uniqueDirections([autoDirectionDegrees, fieldAngleDegrees, fieldAngleDegrees + 90, ...increments]);
+}
+
+function layoutModesForTemplate(template: TrackTemplateRules): PlacementLayoutMode[] {
+  return template.turnCount > 2 ? ["free", "rows"] : ["rows", "free"];
+}
+
+function placementShortfallSummary(result: ReturnType<typeof autoPlaceTracks>, project: ProjectSnapshot): string {
+  if (result.placedTrackCount >= result.requestedTrackCount) {
+    return "";
+  }
+
+  if (result.placedTrackCount === 0) {
+    return `${project.template.name} kunne ikke placeres på den aktuelle mark. Marken er sandsynligvis for lille til længde, skelmargin og ${formatMeters(Math.max(project.minimumTrackSpacingMeters, project.template.minTrackSpacingMeters), 0)} afstand.`;
+  }
+
+  return `Kun ${result.placedTrackCount}/${result.requestedTrackCount} kunne placeres med reglerne overholdt.`;
+}
+
+function capacityWarningForRequest(requestedTrackCount: number, estimate: CapacityEstimate): { status: "warning" | "error"; text: string } | undefined {
+  if (requestedTrackCount > estimate.optimisticTrackCount) {
+    return {
+      status: "error",
+      text: `${estimate.label}: ${requestedTrackCount} spor er over det optimistiske estimat på ${estimate.optimisticTrackCount}. Brug større mark eller færre spor.`
+    };
+  }
+
+  if (requestedTrackCount > estimate.suggestedTrackCount) {
+    return {
+      status: "warning",
+      text: `${estimate.label}: ${requestedTrackCount} spor kan måske lade sig gøre, men det er over det realistiske forslag på ${estimate.suggestedTrackCount}.`
+    };
+  }
+
+  return undefined;
 }
 
 function summarizeRejectedReasons(rejectedReasons: Record<string, number>): string {
