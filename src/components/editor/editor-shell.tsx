@@ -33,13 +33,18 @@ import type {
   ProjectSnapshot,
   ProjectValidationResult,
   Track,
-  TrackTemplateRules
+  TrackTemplateRules,
+  TurnDirection,
+  ValidationMessage
 } from "@/domain/types";
 import { projectToGeoJson, projectToSvg } from "@/domain/export/exporters";
+import { dchTrackTemplates } from "@/domain/rules/templates";
+import { createTrackFromShape } from "@/domain/track/create-track";
 import { calibrateByDimensions, calibrateByDistance, calibrateByKnownArea } from "@/geometry/calibration";
 import { autoPlaceTracks } from "@/geometry/placement/auto-placement";
 import { polygonBounds } from "@/geometry/polygons";
-import { coordinateAtDistance } from "@/geometry/polylines";
+import { calculateSegmentLengths, calculateTrackLength, calculateTurnAngles, coordinateAtDistance } from "@/geometry/polylines";
+import { rotateTrack } from "@/geometry/transforms";
 import { validateProject } from "@/domain/validation/validation";
 import { useEditorStore } from "@/stores/editor-store";
 import { parseAreaInputToM2, formatHectares, formatMeters, formatSquareMeters } from "@/utils/locale";
@@ -63,16 +68,68 @@ type LayerState = {
   tracks: boolean;
 };
 type ContextMenuState = { x: number; y: number; trackId: string } | undefined;
-type PlacementWorkerMessage =
-  | { type: "progress"; stage: string }
-  | { type: "done"; result: PlacementResult }
-  | { type: "error"; message: string };
+type RuleStatus = "ok" | "warning" | "error";
+type RuleCheck = {
+  id: string;
+  label: string;
+  status: RuleStatus;
+  value: string;
+  detail: string;
+  position?: Coordinate;
+  trackId?: string;
+};
+type FocusTarget = { position: Coordinate; label: string; trackId?: string } | undefined;
+type TrackProfile = {
+  code: string;
+  label: string;
+  prefix: string;
+  template: TrackTemplateRules;
+  segmentLengthsMeters: number[];
+  turnAnglesDegrees: number[];
+  turnDirections: TurnDirection[];
+};
+type PlacementReport = {
+  result: PlacementResult;
+  mode: "requested" | "maximum" | "mixed";
+  directionDegrees: number;
+  triedDirections: number[];
+  summary: string;
+};
+
+const trackProfiles: TrackProfile[] = [
+  {
+    code: "DCH_B",
+    label: "B-spor",
+    prefix: "B-spor",
+    template: dchTrackTemplates.find((template) => template.code === "DCH_B") ?? dchTrackTemplates[0],
+    segmentLengthsMeters: [63.75, 22.5, 63.75],
+    turnAnglesDegrees: [90, 90],
+    turnDirections: ["left", "left"]
+  },
+  {
+    code: "DCH_A",
+    label: "A-spor",
+    prefix: "A-spor",
+    template: dchTrackTemplates.find((template) => template.code === "DCH_A") ?? dchTrackTemplates[0],
+    segmentLengthsMeters: [120, 90, 90, 150],
+    turnAnglesDegrees: [90, 90, 60],
+    turnDirections: ["left", "right", "left"]
+  },
+  {
+    code: "DCH_E",
+    label: "E-spor / Elite",
+    prefix: "E-spor",
+    template: dchTrackTemplates.find((template) => template.code === "DCH_E") ?? dchTrackTemplates[0],
+    segmentLengthsMeters: [120, 95, 95, 110, 95, 110, 125],
+    turnAnglesDegrees: [90, 90, 90, 90, 45, 45],
+    turnDirections: ["left", "right", "left", "right", "left", "right"]
+  }
+];
 
 export function EditorShell({ initialProject }: { initialProject: ProjectSnapshot }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const placementAbortRef = useRef<AbortController | null>(null);
-  const placementWorkerRef = useRef<Worker | null>(null);
   const [dragging, setDragging] = useState<DragState>();
   const [validation, setValidation] = useState<ProjectValidationResult>(() => validateProject(initialProject));
   const [placement, setPlacement] = useState<PlacementResult>();
@@ -94,6 +151,13 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
   const [hiddenTrackIds, setHiddenTrackIds] = useState<string[]>([]);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>();
   const [panOffset, setPanOffset] = useState<Coordinate>({ x: 0, y: 0 });
+  const [activeTemplateCode, setActiveTemplateCode] = useState("DCH_B");
+  const [autoDirectionDegrees, setAutoDirectionDegrees] = useState(0);
+  const [autoKeepExisting, setAutoKeepExisting] = useState(false);
+  const [mixedCounts, setMixedCounts] = useState<Record<string, number>>({ DCH_B: 2, DCH_A: 0, DCH_E: 0 });
+  const [rotationNudgeDegrees, setRotationNudgeDegrees] = useState(2.5);
+  const [focusTarget, setFocusTarget] = useState<FocusTarget>();
+  const [placementReport, setPlacementReport] = useState<PlacementReport>();
   const {
     project,
     selectedTrackId,
@@ -110,8 +174,6 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     commitProject,
     addDraftPoint,
     finishFieldPolygon,
-    addTrackAt,
-    replaceTracks,
     translateSelectedTrack,
     rotateSelectedTrack,
     mirrorSelectedTrack,
@@ -127,13 +189,15 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     redo,
     setZoom
   } = useEditorStore();
-  const suggestedTrackCount = useMemo(() => estimateTrackCapacity(project, project.template), [
+  const activeProfile = resolveTrackProfile(activeTemplateCode, project);
+  const fieldAngleDegrees = useMemo(() => fieldPrimaryAngle(project.field.polygon), [project.field.polygon]);
+  const suggestedTrackCount = useMemo(() => estimateTrackCapacity(project, activeProfile.template), [
+    activeProfile.template,
     project.edgeMarginMeters,
     project.field.areaM2,
     project.field.perimeterMeters,
     project.field.polygon,
-    project.minimumTrackSpacingMeters,
-    project.template
+    project.minimumTrackSpacingMeters
   ]);
 
   useEffect(() => {
@@ -228,6 +292,10 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
   const viewBox = useMemo(() => calculateViewBox(project, zoom, panOffset), [panOffset, project, zoom]);
   const viewBoxParts = useMemo(() => viewBox.split(" ").map(Number), [viewBox]);
   const validationMessages = useMemo(() => [...validation.errors, ...validation.warnings], [validation]);
+  const selectedTrackRuleChecks = useMemo(
+    () => (selectedTrack ? buildTrackRuleChecks(project, selectedTrack, validation) : []),
+    [project, selectedTrack, validation]
+  );
   const backgroundImage = project.field.backgroundImage;
   const backgroundCrop = useMemo(() => (backgroundImage ? cropRectForBackground(backgroundImage) : undefined), [backgroundImage]);
 
@@ -260,6 +328,21 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     [snapStep, snapToGrid]
   );
 
+  function addTrackAtPoint(point: Coordinate) {
+    const displayNo = project.tracks.length + 1;
+    const track = createTrackFromShape(
+      createClientTrackId(),
+      displayNo,
+      point,
+      displayNo % 2 === 0 ? 180 : 0,
+      activeProfile.template,
+      activeProfile,
+      activeProfile.prefix
+    );
+    commitProject({ ...withActiveTemplate(project, activeProfile.template), tracks: [...project.tracks, track] });
+    selectTrack(track.id);
+  }
+
   function handleCanvasPointerDown(event: React.PointerEvent<SVGSVGElement>) {
     const rawPoint = toWorld(event);
     const point = snapWorldPoint(rawPoint);
@@ -283,7 +366,7 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     }
 
     if (tool === "add-track") {
-      addTrackAt(point);
+      addTrackAtPoint(point);
       return;
     }
 
@@ -354,20 +437,18 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     }
   }
 
-  async function handleAutoPlacement() {
-    if (placementRunning) {
-      return;
-    }
-
-    const controller = new AbortController();
-    placementAbortRef.current = controller;
-    setPlacementRunning(true);
-    setPlacementStage("Forbereder mark ...");
-    const options: PlacementOptions = {
-      requestedTrackCount: project.requestedTrackCount,
+  function createPlacementOptions(
+    requestedTrackCount: number,
+    fixedTracks: Track[],
+    directionDegrees: number,
+    template: TrackTemplateRules
+  ): PlacementOptions {
+    return {
+      requestedTrackCount,
+      fixedTracks,
       edgeMarginMeters: project.edgeMarginMeters,
-      minimumTrackSpacingMeters: project.minimumTrackSpacingMeters,
-      preferredDirectionDegrees: 0,
+      minimumTrackSpacingMeters: Math.max(project.minimumTrackSpacingMeters, template.minTrackSpacingMeters),
+      preferredDirectionDegrees: directionDegrees,
       allowMirror: true,
       alternateStartDirections: true,
       placeInRows: true,
@@ -375,42 +456,60 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
       varySegmentLengths: true,
       seed: 42
     };
+  }
+
+  function findBestPlacement(
+    placementProject: ProjectSnapshot,
+    requestedTrackCount: number,
+    fixedTracks: Track[],
+    mode: PlacementReport["mode"]
+  ): PlacementReport {
+    const directions = uniqueDirections([autoDirectionDegrees, fieldAngleDegrees, 0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165]);
+    const attempts = directions.map((directionDegrees) => {
+      const result = autoPlaceTracks(placementProject, createPlacementOptions(requestedTrackCount, fixedTracks, directionDegrees, placementProject.template));
+      return { result, directionDegrees };
+    });
+    const best = attempts.sort((a, b) => {
+      if (b.result.placedTrackCount !== a.result.placedTrackCount) {
+        return b.result.placedTrackCount - a.result.placedTrackCount;
+      }
+      return b.result.score - a.result.score;
+    })[0];
+
+    return {
+      result: { ...best.result, tracks: relabelTracks(best.result.tracks) },
+      mode,
+      directionDegrees: best.directionDegrees,
+      triedDirections: directions,
+      summary: summarizeRejectedReasons(best.result.rejectedReasons) || "Alle valgte spor kunne placeres uden regelbrud."
+    };
+  }
+
+  async function handleAutoPlacement(mode: PlacementReport["mode"] = "requested") {
+    if (placementRunning) {
+      return;
+    }
+
+    const controller = new AbortController();
+    placementAbortRef.current = controller;
+    setPlacementRunning(true);
+    setPlacementStage(mode === "maximum" ? "Finder maks antal lovlige spor ..." : "Prøver flere retninger ...");
 
     try {
       await wait(40);
       if (controller.signal.aborted) return;
-      setPlacementStage("Genererer kandidater ...");
-      let localPreview: PlacementResult;
-      try {
-        localPreview = await runPlacementWorker(project, options, controller.signal, setPlacementStage);
-      } catch (error) {
-        if (error instanceof DOMException && error.name === "AbortError") {
-          throw error;
-        }
-        localPreview = autoPlaceTracks(project, options);
-      }
-      setPlacement(localPreview);
-      await wait(40);
-      if (controller.signal.aborted) return;
-      setPlacementStage("Tester placeringer ...");
-      const response = await fetch(`/api/projects/${project.id}/placement`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(options),
-        signal: controller.signal
-      });
-      const payload = (await response.json()) as ApiResponse<{ result: PlacementResult; project: ProjectSnapshot | null }>;
-      if (payload.success) {
-        setPlacement(payload.data.result);
-        if (payload.data.project) {
-          replaceTracks(payload.data.project.tracks);
-        } else {
-          replaceTracks(payload.data.result.tracks);
-        }
-        setPlacementStage("Færdig");
-      } else {
-        setPlacementStage(payload.error.message);
-      }
+      const requestedTrackCount = mode === "maximum" ? 1000 : project.requestedTrackCount;
+      const fixedTracks = autoKeepExisting ? project.tracks : [];
+      const placementProject = withActiveTemplate({ ...project, requestedTrackCount }, activeProfile.template);
+      const report = findBestPlacement(placementProject, requestedTrackCount, fixedTracks, mode);
+      setPlacement(report.result);
+      setPlacementReport(report);
+      commitProject({ ...placementProject, tracks: report.result.tracks });
+      setPlacementStage(
+        mode === "maximum"
+          ? `${report.result.placedTrackCount} nye spor fundet som maks · retning ${formatDegrees(report.directionDegrees)}`
+          : `${report.result.placedTrackCount}/${report.result.requestedTrackCount} nye spor placeret · retning ${formatDegrees(report.directionDegrees)}`
+      );
     } catch (error) {
       setPlacementStage(error instanceof DOMException && error.name === "AbortError" ? "Annulleret" : "Placering fejlede");
     } finally {
@@ -419,69 +518,71 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     }
   }
 
-  function cancelAutoPlacement() {
-    placementAbortRef.current?.abort();
-    placementWorkerRef.current?.terminate();
-    placementWorkerRef.current = null;
-    setPlacementRunning(false);
-    setPlacementStage("Annulleret");
-  }
-
-  function runPlacementWorker(
-    workerProject: ProjectSnapshot,
-    options: PlacementOptions,
-    signal: AbortSignal,
-    onProgress: (stage: string) => void
-  ): Promise<PlacementResult> {
-    if (typeof Worker === "undefined") {
-      return Promise.reject(new Error("Worker er ikke tilgængelig."));
+  async function handleMixedPlacement() {
+    if (placementRunning) {
+      return;
     }
 
-    return new Promise((resolve, reject) => {
-      const worker = new Worker(new URL("../../workers/placement-worker.ts", import.meta.url), { type: "module" });
-      let settled = false;
-      placementWorkerRef.current = worker;
+    const entries = trackProfiles
+      .map((profile) => ({ profile, count: normalizeOptionalTrackCount(Number(mixedCounts[profile.code] ?? 0)) }))
+      .filter((entry) => entry.count > 0);
 
-      const cleanup = () => {
-        worker.terminate();
-        placementWorkerRef.current = null;
+    if (entries.length === 0) {
+      setPlacementStage("Vælg mindst én B/A/E-type til mix.");
+      return;
+    }
+
+    setPlacementRunning(true);
+    setPlacementStage("Autoplacerer B/A/E-mix ...");
+
+    try {
+      await wait(40);
+      let placed = autoKeepExisting ? relabelTracks(project.tracks) : [];
+      let nextProject = { ...project, tracks: placed, templates: project.templates ?? dchTrackTemplates };
+      const summaries: string[] = [];
+
+      entries.forEach(({ profile, count }) => {
+        const resolvedProfile = resolveTrackProfile(profile.code, nextProject);
+        const placementProject = withActiveTemplate({ ...nextProject, requestedTrackCount: count }, resolvedProfile.template);
+        const report = findBestPlacement(placementProject, count, placed, "mixed");
+        placed = relabelTracks(report.result.tracks);
+        nextProject = { ...placementProject, tracks: placed, templates: placementProject.templates ?? dchTrackTemplates };
+        summaries.push(
+          report.result.placedTrackCount < count
+            ? `${resolvedProfile.label}: ${report.result.placedTrackCount}/${count} (${report.summary})`
+            : `${resolvedProfile.label}: ${report.result.placedTrackCount}/${count}`
+        );
+      });
+
+      const result: PlacementResult = {
+        labelDa: "Bedste fundne forslag",
+        tracks: placed,
+        requestedTrackCount: entries.reduce((sum, entry) => sum + entry.count, 0),
+        placedTrackCount: placed.length - (autoKeepExisting ? project.tracks.length : 0),
+        durationMs: 1,
+        score: placed.length,
+        candidatesEvaluated: 0,
+        rejectedReasons: {}
       };
+      setPlacement(result);
+      setPlacementReport({
+        result,
+        mode: "mixed",
+        directionDegrees: autoDirectionDegrees,
+        triedDirections: [],
+        summary: summaries.join(" · ")
+      });
+      commitProject({ ...nextProject, tracks: placed });
+      setPlacementStage(`Mix placeret: ${summaries.join(" · ")}`);
+    } finally {
+      setPlacementRunning(false);
+    }
+  }
 
-      signal.addEventListener(
-        "abort",
-        () => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          reject(new DOMException("Placering blev annulleret.", "AbortError"));
-        },
-        { once: true }
-      );
-
-      worker.onmessage = (event: MessageEvent<PlacementWorkerMessage>) => {
-        if (settled) return;
-        if (event.data.type === "progress") {
-          onProgress(event.data.stage);
-          return;
-        }
-        settled = true;
-        cleanup();
-        if (event.data.type === "done") {
-          resolve(event.data.result);
-        } else {
-          reject(new Error(event.data.message));
-        }
-      };
-
-      worker.onerror = () => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(new Error("Workerplacering fejlede."));
-      };
-
-      worker.postMessage({ project: workerProject, options });
-    });
+  function cancelAutoPlacement() {
+    placementAbortRef.current?.abort();
+    setPlacementRunning(false);
+    setPlacementStage("Annulleret");
   }
 
   async function handleUpload(file?: File) {
@@ -580,6 +681,12 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     }
   }
 
+  async function saveFieldVariant() {
+    setPlacementStage("Gemmer markvariant ...");
+    const response = await fetch(`/api/projects/${project.id}/versions`, { method: "POST" });
+    setPlacementStage(response.ok ? "Markvariant gemt i versionshistorikken" : "Kunne ikke gemme markvariant");
+  }
+
   function downloadProject(format: "json" | "svg" | "geojson") {
     const content =
       format === "json"
@@ -672,6 +779,49 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
     setContextMenu(undefined);
   }
 
+  function selectedIds(): string[] {
+    return selectedTrackIds.length > 0 ? selectedTrackIds : selectedTrackId ? [selectedTrackId] : [];
+  }
+
+  function rotateSelectedAroundCenter(angleDegrees: number, label: string) {
+    const selected = selectedIds();
+    if (selected.length === 0) return;
+    commitProject({
+      ...project,
+      tracks: project.tracks.map((track) => (selected.includes(track.id) ? rotateTrack(track, angleDegrees, trackCenter(track)) : track))
+    });
+    setPlacementStage(label);
+  }
+
+  function alignSelectedToField() {
+    const selected = selectedIds();
+    if (selected.length === 0) return;
+    commitProject({
+      ...project,
+      tracks: project.tracks.map((track) =>
+        selected.includes(track.id) ? rotateTrack(track, signedAngleDelta(track.rotationDegrees, fieldAngleDegrees), trackCenter(track)) : track
+      )
+    });
+    setPlacementStage(`Markerede spor rettet til markretning ${formatDegrees(fieldAngleDegrees)}`);
+  }
+
+  function focusRule(check: RuleCheck) {
+    if (check.trackId) {
+      selectTrack(check.trackId);
+    }
+
+    if (!check.position) {
+      setPlacementStage(check.detail);
+      return;
+    }
+
+    setFocusTarget({ position: check.position, label: check.label, trackId: check.trackId });
+    const nextZoom = Math.max(1.8, zoom);
+    setZoom(nextZoom);
+    setPanOffset(panOffsetForPoint(project, nextZoom, check.position));
+    setPlacementStage(check.detail);
+  }
+
   return (
     <div className="flex min-h-screen flex-col bg-[#f5f7f4] text-ink-900">
       <header className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-white px-4 py-3">
@@ -694,7 +844,7 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
           <Link href={`/projects/${project.id}/settings`} className="inline-flex">
             <Button icon={<Layers size={16} />}>Indstillinger</Button>
           </Link>
-          <Button variant="primary" icon={<Sparkles size={16} />} onClick={handleAutoPlacement} disabled={placementRunning}>
+          <Button variant="primary" icon={<Sparkles size={16} />} onClick={() => void handleAutoPlacement("requested")} disabled={placementRunning}>
             Automatisk placering
           </Button>
           {placementRunning ? (
@@ -736,6 +886,15 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
               <div className="rounded-md bg-field-50 p-3">
                 <p className="text-xs text-ink-500">Hektar</p>
                 <p className="font-semibold">{formatHectares(project.field.areaM2)}</p>
+              </div>
+            </div>
+            <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-ink-500">Markretning</p>
+                  <p className="font-semibold">{formatDegrees(fieldAngleDegrees)}</p>
+                </div>
+                <Button onClick={() => void saveFieldVariant()}>Gem markvariant</Button>
               </div>
             </div>
             <div className="flex gap-2">
@@ -873,12 +1032,26 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
 
           <section className="mt-6 space-y-3">
             <h2 className="text-sm font-semibold">Spor</h2>
+            <label className="block text-xs font-medium text-ink-700">
+              Sportype
+              <select
+                className="mt-1 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm"
+                value={activeTemplateCode}
+                onChange={(event) => setActiveTemplateCode(event.currentTarget.value)}
+              >
+                {trackProfiles.map((profile) => (
+                  <option key={profile.code} value={profile.code}>
+                    {profile.label}
+                  </option>
+                ))}
+              </select>
+            </label>
             <div className="flex flex-wrap gap-2">
               <Button variant={tool === "pan" ? "primary" : "secondary"} icon={<Move size={16} />} onClick={() => setTool("pan")}>
                 Panorér
               </Button>
               <Button variant={tool === "add-track" ? "primary" : "secondary"} icon={<Plus size={16} />} onClick={() => setTool("add-track")}>
-                Tilføj B-spor
+                Tilføj {activeProfile.label}
               </Button>
               <Button icon={<Layers size={16} />} onClick={() => setTool("add-obstacle")}>
                 Forbudt område
@@ -952,6 +1125,54 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
                   Brug
                 </Button>
               </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <Button variant="primary" icon={<Sparkles size={16} />} onClick={() => void handleAutoPlacement("requested")} disabled={placementRunning}>
+                Autoplacer valgt
+              </Button>
+              <Button icon={<Sparkles size={16} />} onClick={() => void handleAutoPlacement("maximum")} disabled={placementRunning}>
+                Placer maks
+              </Button>
+            </div>
+            <label className="block text-xs font-medium text-ink-700">
+              Auto-retning
+              <Input
+                type="number"
+                step={1}
+                value={autoDirectionDegrees}
+                onChange={(event) => setAutoDirectionDegrees(normalizeDegrees(Number(event.currentTarget.value) || 0))}
+              />
+            </label>
+            <div className="flex flex-wrap gap-2">
+              <Button onClick={() => setAutoDirectionDegrees(fieldAngleDegrees)}>Brug markretning {formatDegrees(fieldAngleDegrees)}</Button>
+              <Button onClick={() => setPlacementStage(`Markens primære retning er ${formatDegrees(fieldAngleDegrees)}`)}>Vis markretning</Button>
+            </div>
+            <label className="flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
+              <input type="checkbox" checked={autoKeepExisting} onChange={(event) => setAutoKeepExisting(event.currentTarget.checked)} />
+              Behold eksisterende spor og læg nye udenom
+            </label>
+            <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
+              <h3 className="text-xs font-semibold uppercase text-ink-500">B/A/E-mix</h3>
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                {trackProfiles.map((profile) => (
+                  <label key={profile.code} className="block text-xs font-medium text-ink-700">
+                    {profile.label}
+                    <Input
+                      type="number"
+                      min={0}
+                      max={1000}
+                      value={mixedCounts[profile.code] ?? 0}
+                      onChange={(event) => {
+                        const nextCount = normalizeOptionalTrackCount(Number(event.currentTarget.value));
+                        setMixedCounts((current) => ({ ...current, [profile.code]: nextCount }));
+                      }}
+                    />
+                  </label>
+                ))}
+              </div>
+              <Button className="mt-3 w-full" variant="primary" onClick={() => void handleMixedPlacement()} disabled={placementRunning}>
+                Autoplacer mix
+              </Button>
             </div>
             <label className="block text-xs font-medium text-ink-700">
               Kantmargin
@@ -1193,6 +1414,8 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
                 ))
               : null}
 
+            {focusTarget ? <FocusMarker target={focusTarget} viewBoxParts={viewBoxParts} /> : null}
+
             {validationMessages.map((message, index) =>
               message.position ? (
                 <g key={`${message.code}-${index}`}>
@@ -1248,7 +1471,13 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
                 <div className="rounded-md border border-slate-200 p-3">
                   <p className="font-semibold">{selectedTrack.name}</p>
                   <p className="text-sm text-ink-500">
-                    {selectedTrack.lengthSteps} skridt · {formatMeters(selectedTrack.lengthMeters)}
+                    {selectedTrack.lengthSteps} skridt · {formatMeters(calculateTrackLength(selectedTrack))}
+                  </p>
+                  <p className="mt-1 text-xs text-ink-500">
+                    Segmenter: {calculateSegmentLengths(selectedTrack.points).map((length) => formatMeters(length)).join(" · ")}
+                  </p>
+                  <p className="mt-1 text-xs text-ink-500">
+                    Knæk: {calculateTurnAngles(selectedTrack.points).map((angle) => `${Math.round(angle)}°`).join(" · ") || "-"}
                   </p>
                   {selectedTrackIds.length > 1 ? (
                     <p className="mt-1 text-xs text-field-700">{selectedTrackIds.length} markerede spor redigeres samlet.</p>
@@ -1265,8 +1494,26 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
                     Duplikér
                   </Button>
                   <Button onClick={reverseSelectedTrack}>Vend start/slut</Button>
+                  <Button onClick={alignSelectedToField}>Ret til mark</Button>
                   <Button icon={<Trash2 size={16} />} variant="danger" onClick={deleteSelectedTrack}>
                     Slet
+                  </Button>
+                </div>
+                <div className="rounded-md border border-slate-200 bg-slate-50 p-3">
+                  <label className="block text-xs font-medium text-ink-700">
+                    Finrotation {rotationNudgeDegrees}°
+                    <input
+                      className="mt-2 w-full accent-field-700"
+                      type="range"
+                      min={-15}
+                      max={15}
+                      step={0.5}
+                      value={rotationNudgeDegrees}
+                      onChange={(event) => setRotationNudgeDegrees(Number(event.currentTarget.value))}
+                    />
+                  </label>
+                  <Button className="mt-3 w-full" onClick={() => rotateSelectedAroundCenter(rotationNudgeDegrees, `Markerede spor roteret ${rotationNudgeDegrees}°`)}>
+                    Anvend finrotation
                   </Button>
                 </div>
                 <div className="rounded-md bg-slate-50 p-3 text-sm">
@@ -1320,6 +1567,15 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
           </section>
 
           <section className="mt-6 space-y-3">
+            <h2 className="text-sm font-semibold">Regelstatus</h2>
+            {selectedTrack ? (
+              <RuleStatusPanel track={selectedTrack} checks={selectedTrackRuleChecks} onFocus={focusRule} />
+            ) : (
+              <p className="rounded-md bg-slate-50 p-3 text-sm text-ink-500">Vælg et spor for at se regelstatus.</p>
+            )}
+          </section>
+
+          <section className="mt-6 space-y-3">
             <h2 className="text-sm font-semibold">Validering</h2>
             <div className="max-h-56 space-y-2 overflow-auto pr-1">
               {validationMessages.length === 0 ? (
@@ -1342,14 +1598,25 @@ export function EditorShell({ initialProject }: { initialProject: ProjectSnapsho
 
           <section className="mt-6 space-y-3">
             <h2 className="text-sm font-semibold">Bedste fundne forslag</h2>
-            {placement ? (
+            {placementReport ? (
+              <div className="rounded-md bg-slate-50 p-3 text-sm">
+                <p>
+                  {placementReport.result.placedTrackCount} af {placementReport.result.requestedTrackCount} nye spor placeret
+                </p>
+                <p>Retning: {formatDegrees(placementReport.directionDegrees)}</p>
+                <p>{placementReport.summary}</p>
+                {placementReport.triedDirections.length > 0 ? (
+                  <p className="mt-1 text-xs text-ink-500">Retninger prøvet: {placementReport.triedDirections.map(formatDegrees).join(", ")}</p>
+                ) : null}
+                <p className="mt-1 text-xs text-ink-500">Kandidater vurderet: {placementReport.result.candidatesEvaluated}</p>
+              </div>
+            ) : placement ? (
               <div className="rounded-md bg-slate-50 p-3 text-sm">
                 <p>
                   {placement.placedTrackCount} af {placement.requestedTrackCount} spor placeret
                 </p>
                 <p>Score: {placement.score.toFixed(0)}</p>
                 <p>Kandidater vurderet: {placement.candidatesEvaluated}</p>
-                <p>Beregningstid: {placement.durationMs} ms</p>
               </div>
             ) : (
               <p className="text-sm text-ink-500">Kør automatisk placering for at se forslag.</p>
@@ -1408,6 +1675,69 @@ function ContextMenuRow({
       <text x={x + 4} y={rowY + 6.5} className={danger ? "fill-red-700 text-[4px]" : "fill-ink-800 text-[4px]"}>
         {label}
       </text>
+    </g>
+  );
+}
+
+function RuleStatusPanel({ track, checks, onFocus }: { track: Track; checks: RuleCheck[]; onFocus: (check: RuleCheck) => void }) {
+  const errors = checks.filter((check) => check.status === "error").length;
+  const warnings = checks.filter((check) => check.status === "warning").length;
+
+  return (
+    <div className="space-y-2">
+      <div
+        className={cn(
+          "flex items-center justify-between gap-3 rounded-md border p-3 text-sm",
+          errors > 0
+            ? "border-red-200 bg-red-50 text-red-800"
+            : warnings > 0
+              ? "border-amber-200 bg-amber-50 text-amber-800"
+              : "border-emerald-200 bg-emerald-50 text-emerald-800"
+        )}
+      >
+        <strong>{track.name}</strong>
+        <span>{errors > 0 ? `${errors} fejl` : warnings > 0 ? `${warnings} advarsler` : "Alle hovedregler ok"}</span>
+      </div>
+      <div className="space-y-2">
+        {checks.map((check) => (
+          <button
+            key={check.id}
+            className={cn(
+              "grid w-full grid-cols-[10px_minmax(0,1fr)_auto] items-center gap-2 rounded-md border px-3 py-2 text-left text-sm",
+              check.status === "error"
+                ? "border-red-200 bg-red-50"
+                : check.status === "warning"
+                  ? "border-amber-200 bg-amber-50"
+                  : "border-slate-200 bg-white"
+            )}
+            onClick={() => onFocus(check)}
+          >
+            <span
+              className={cn(
+                "h-2 w-2 rounded-full",
+                check.status === "error" ? "bg-red-700" : check.status === "warning" ? "bg-amber-600" : "bg-emerald-700"
+              )}
+            />
+            <span>
+              <strong className="block">{check.label}</strong>
+              <small className="block text-xs text-ink-500">{check.detail}</small>
+            </span>
+            <em className="text-right text-xs not-italic text-ink-500">{check.value}</em>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function FocusMarker({ target, viewBoxParts }: { target: NonNullable<FocusTarget>; viewBoxParts: number[] }) {
+  const width = viewBoxParts[2] ?? 300;
+  const radius = Math.max(6, width / 42);
+
+  return (
+    <g pointerEvents="none">
+      <circle cx={target.position.x} cy={target.position.y} r={radius} fill="none" stroke="#16201b" strokeWidth={Math.max(1, width / 260)} opacity={0.82} />
+      <circle cx={target.position.x} cy={target.position.y} r={radius * 0.55} fill="none" stroke="#ffffff" strokeWidth={Math.max(0.8, width / 420)} opacity={0.9} />
     </g>
   );
 }
@@ -1506,6 +1836,234 @@ function calculateViewBox(project: ProjectSnapshot, zoom: number, panOffset: Coo
 
 function normalizeTrackCount(value: number): number {
   return Math.max(1, Math.min(1000, Math.round(value || 1)));
+}
+
+function normalizeOptionalTrackCount(value: number): number {
+  return Math.max(0, Math.min(1000, Math.round(Number.isFinite(value) ? value : 0)));
+}
+
+function normalizeDegrees(value: number): number {
+  return ((value % 180) + 180) % 180;
+}
+
+function signedAngleDelta(fromDegrees: number, toDegrees: number): number {
+  return ((((toDegrees - fromDegrees) % 360) + 540) % 360) - 180;
+}
+
+function formatDegrees(value: number): string {
+  return `${Number(normalizeDegrees(value).toFixed(1))}°`;
+}
+
+function uniqueDirections(values: number[]): number[] {
+  return [...new Set(values.map((value) => normalizeDegrees(Math.round(value))))];
+}
+
+function summarizeRejectedReasons(rejectedReasons: Record<string, number>): string {
+  const labels: Record<string, string> = {
+    OUTSIDE_FIELD: "uden for marken",
+    EDGE_MARGIN: "for tæt på skel",
+    TRACK_INTERSECTION: "krydsede andre spor",
+    TRACK_SPACING: "for tæt på andre spor",
+    RESTRICTED_AREA: "ramte forbudt område",
+    MIDDLE_SEGMENT_LENGTH: "havde for korte ben mellem knæk",
+    TURN_ANGLE: "havde forkerte knæk"
+  };
+  const entries = Object.entries(rejectedReasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return `Afviste kandidater især fordi de ${entries.map(([code, count]) => `${labels[code] ?? code} (${count})`).join(", ")}.`;
+}
+
+function fieldPrimaryAngle(polygon: Coordinate[]): number {
+  if (polygon.length < 2) {
+    return 0;
+  }
+
+  let longest = { length: 0, angle: 0 };
+  for (let index = 0; index < polygon.length; index += 1) {
+    const start = polygon[index];
+    const end = polygon[(index + 1) % polygon.length];
+    const length = Math.hypot(end.x - start.x, end.y - start.y);
+
+    if (length > longest.length) {
+      longest = { length, angle: (Math.atan2(end.y - start.y, end.x - start.x) * 180) / Math.PI };
+    }
+  }
+
+  return normalizeDegrees(longest.angle);
+}
+
+function resolveTrackProfile(code: string, project: ProjectSnapshot): TrackProfile {
+  const baseProfile = trackProfiles.find((profile) => profile.code === code) ?? trackProfiles[0];
+  const template =
+    code === project.template.code
+      ? project.template
+      : project.templates?.find((candidate) => candidate.code === code) ?? dchTrackTemplates.find((candidate) => candidate.code === code) ?? baseProfile.template;
+
+  return {
+    ...baseProfile,
+    template,
+    segmentLengthsMeters: scaledSegments(baseProfile.segmentLengthsMeters, template.lengthMeters)
+  };
+}
+
+function scaledSegments(segments: number[], targetLengthMeters: number): number[] {
+  const currentLength = segments.reduce((sum, length) => sum + length, 0);
+  const scale = targetLengthMeters / currentLength;
+  return segments.map((length) => length * scale);
+}
+
+function withActiveTemplate(project: ProjectSnapshot, template: TrackTemplateRules): ProjectSnapshot {
+  return {
+    ...project,
+    template,
+    templates: replaceTemplate(project.templates ?? dchTrackTemplates, template)
+  };
+}
+
+function replaceTemplate(templates: TrackTemplateRules[], template: TrackTemplateRules): TrackTemplateRules[] {
+  return templates.some((candidate) => candidate.code === template.code)
+    ? templates.map((candidate) => (candidate.code === template.code ? template : candidate))
+    : [...templates, template];
+}
+
+function rulesForTrack(project: ProjectSnapshot, track: Track): TrackTemplateRules {
+  if (!track.templateCode || track.templateCode === project.template.code) {
+    return project.template;
+  }
+
+  return project.templates?.find((template) => template.code === track.templateCode) ?? project.template;
+}
+
+function buildTrackRuleChecks(project: ProjectSnapshot, track: Track, validation: ProjectValidationResult): RuleCheck[] {
+  const rules = rulesForTrack(project, track);
+  const result = validation.tracks[track.id];
+  const messages = [...(result?.errors ?? []), ...(result?.warnings ?? [])];
+  const measurements = result?.measurements;
+  const expectedAngles = rules.turnAnglesDegrees ?? Array.from({ length: rules.turnCount }, () => rules.turnAngleDegrees);
+  const turnAngles = measurements?.turnAnglesDegrees ?? calculateTurnAngles(track.points);
+  const segmentLengths = measurements?.segmentLengthsMeters ?? calculateSegmentLengths(track.points);
+  const lengthMeters = measurements?.totalLengthMeters ?? calculateTrackLength(track);
+  const nearestBoundary = measurements?.nearestBoundaryDistanceMeters;
+  const nearestTrack = measurements?.nearestTrackDistanceMeters;
+
+  return [
+    ruleCheck("length", "Længde", ["TRACK_LENGTH"], messages, track, {
+      value: `${formatMeters(lengthMeters)} / ${formatMeters(rules.lengthMeters)}`,
+      detail: `Tolerance ${formatMeters(rules.lengthToleranceMeters)}`
+    }),
+    ruleCheck("turns", "Knæk", ["TRACK_POINT_COUNT", "SEGMENT_COUNT", "TURN_ANGLE"], messages, track, {
+      value: turnAngles.map((angle) => `${Math.round(angle)}°`).join(" · ") || "-",
+      detail: `Krav: ${expectedAngles.map((angle) => `${angle}°`).join(" · ")}`
+    }),
+    ruleCheck("middle", "Ben mellem knæk", ["MIDDLE_SEGMENT_LENGTH"], messages, track, {
+      value: segmentLengths.slice(1, -1).map((length) => formatMeters(length)).join(" · ") || "-",
+      detail: `Minimum ${formatMeters(rules.minMiddleSegmentMeters)}`
+    }),
+    ruleCheck("field", "Mark og skel", ["OUTSIDE_FIELD", "EDGE_MARGIN"], messages, track, {
+      value: nearestBoundary === undefined ? "-" : formatMeters(nearestBoundary),
+      detail: `Kantmargin ${formatMeters(project.edgeMarginMeters)}`
+    }),
+    ruleCheck("spacing", "Afstand/kryds", ["TRACK_INTERSECTION", "TRACK_SPACING", "SELF_INTERSECTION"], messages, track, {
+      value: nearestTrack === undefined ? "Ingen nabo" : formatMeters(nearestTrack),
+      detail: `Minimum ${formatMeters(project.minimumTrackSpacingMeters)} mellem spor`
+    }),
+    ruleCheck("objects", "Genstande", ["OBJECT_COUNT", "OBJECT_TOO_CLOSE_TO_FINISH"], messages, track, {
+      value: `${track.objects.length}/${rules.objectCount}`,
+      detail: `Øvrige genstande skal ligge mindst ${formatMeters(rules.minLastObjectToFinishMeters)} før slut`
+    }),
+    ruleCheck("restricted", "Forbudte områder", ["RESTRICTED_AREA"], messages, track, {
+      value: project.restrictedAreas.filter((area) => area.active).length === 0 ? "Ingen" : `${project.restrictedAreas.filter((area) => area.active).length} aktive`,
+      detail: "Sporet må ikke ramme aktive forbudszoner"
+    })
+  ];
+}
+
+function ruleCheck(
+  id: string,
+  label: string,
+  codes: string[],
+  messages: ValidationMessage[],
+  track: Track,
+  fallback: { value: string; detail: string }
+): RuleCheck {
+  const matching = messages.find((message) => codes.includes(message.code));
+
+  if (!matching) {
+    return {
+      id,
+      label,
+      status: "ok",
+      value: fallback.value,
+      detail: fallback.detail,
+      position: trackCenter(track),
+      trackId: track.id
+    };
+  }
+
+  return {
+    id,
+    label,
+    status: matching.severity === "error" ? "error" : "warning",
+    value:
+      matching.actualValue !== undefined && matching.requiredValue !== undefined
+        ? `${Number(matching.actualValue.toFixed(1))}/${Number(matching.requiredValue.toFixed(1))} ${matching.unit ?? ""}`.trim()
+        : fallback.value,
+    detail: matching.messageDa,
+    position: matching.position ?? trackCenter(track),
+    trackId: track.id
+  };
+}
+
+function relabelTracks(tracks: Track[]): Track[] {
+  return tracks.map((track, index) => ({ ...track, displayNo: index + 1, name: renameTrack(track, index + 1) }));
+}
+
+function renameTrack(track: Track, displayNo: number): string {
+  const prefix = trackProfiles.find((profile) => profile.code === track.templateCode)?.prefix ?? "Spor";
+  return `${prefix} ${displayNo}`;
+}
+
+function trackCenter(track: Track): Coordinate {
+  const sum = track.points.reduce((accumulator, point) => ({ x: accumulator.x + point.x, y: accumulator.y + point.y }), {
+    x: 0,
+    y: 0
+  });
+  return { x: sum.x / track.points.length, y: sum.y / track.points.length };
+}
+
+function panOffsetForPoint(project: ProjectSnapshot, zoom: number, point: Coordinate): Coordinate {
+  const bounds = boundsForProject(project);
+  const width = (bounds.maxX - bounds.minX + 40) / zoom;
+  const height = (bounds.maxY - bounds.minY + 40) / zoom;
+
+  return {
+    x: point.x - width / 2 - (bounds.minX - 20),
+    y: point.y - height / 2 - (bounds.minY - 20)
+  };
+}
+
+function boundsForProject(project: ProjectSnapshot): { minX: number; minY: number; maxX: number; maxY: number } {
+  const points = [
+    ...project.field.polygon,
+    ...project.tracks.flatMap((track) => track.points),
+    ...project.restrictedAreas.flatMap((area) => (area.type === "polygon" ? area.polygon : []))
+  ];
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  return {
+    minX: Math.min(...xs),
+    minY: Math.min(...ys),
+    maxX: Math.max(...xs),
+    maxY: Math.max(...ys)
+  };
+}
+
+function createClientTrackId(): string {
+  return `track-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
 }
 
 function estimateTrackCapacity(project: ProjectSnapshot, template: TrackTemplateRules): number {
