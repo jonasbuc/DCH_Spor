@@ -1,6 +1,6 @@
 import type { FeatureCollection, LineString, Polygon } from "geojson";
 import type { Coordinate, ProjectSnapshot, Track } from "@/domain/types";
-import { calculateSegmentLengths, calculateTrackLength, coordinateAtDistance } from "@/geometry/polylines";
+import { calculateSegmentLengths, calculateTrackLength, calculateTurnAngles, coordinateAtDistance } from "@/geometry/polylines";
 import { toClosedRing } from "@/geometry/polygons";
 import { formatHectares, formatMeters, formatSquareMeters } from "@/utils/locale";
 
@@ -113,6 +113,7 @@ export function projectToSvg(project: ProjectSnapshot, options: { width?: number
 export function trackSheetMarkdown(project: ProjectSnapshot, track: Track): string {
   const segmentLengths = calculateSegmentLengths(track.points);
   const lengthMeters = calculateTrackLength(track);
+  const turnAngles = calculateTurnAngles(track.points);
 
   return [
     `# Sporlæggerark - ${track.name}`,
@@ -121,7 +122,7 @@ export function trackSheetMarkdown(project: ProjectSnapshot, track: Track): stri
     `Klub: ${project.club || "-"}`,
     `Samlet længde: ${track.lengthSteps} skridt / ${formatMeters(lengthMeters)}`,
     `Segmenter: ${segmentLengths.map((length) => formatMeters(length)).join(" · ")}`,
-    `Knæk: 2 x 90 grader`,
+    `Knæk: ${turnAngles.map((angle) => `${Math.round(angle)} grader`).join(" · ") || "-"}`,
     "",
     "## Genstande",
     ...track.objects.map(

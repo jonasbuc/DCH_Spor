@@ -263,6 +263,25 @@ const tests: { name: string; run: () => void }[] = [
       assert.equal(longerBPlacement.placedTrackCount, 4);
       assert.equal(validateProject({ ...longerBProject, tracks: longerBPlacement.tracks }).valid, true);
       assert.ok(longerBPlacement.tracks.every((track) => Math.abs(calculateTrackLength(track) - longerBTemplate.lengthMeters) < 0.001));
+
+      const projectWithFixedTrack = createDemoProject("fixed-track");
+      const fixedTrack = projectWithFixedTrack.tracks[0];
+      const addOnePlacement = autoPlaceTracks({ ...projectWithFixedTrack, tracks: [fixedTrack] }, {
+        requestedTrackCount: 1,
+        fixedTracks: [fixedTrack],
+        edgeMarginMeters: 8,
+        minimumTrackSpacingMeters: 15,
+        preferredDirectionDegrees: 0,
+        allowMirror: true,
+        alternateStartDirections: true,
+        placeInRows: true,
+        sameShape: false,
+        varySegmentLengths: true,
+        seed: 123
+      });
+      assert.equal(addOnePlacement.placedTrackCount, 1);
+      assert.equal(addOnePlacement.tracks.length, 2);
+      assert.equal(validateProject({ ...projectWithFixedTrack, tracks: addOnePlacement.tracks }).valid, true);
     }
   }
 ];

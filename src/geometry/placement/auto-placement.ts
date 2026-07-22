@@ -7,6 +7,7 @@ import { polygonBounds } from "@/geometry/polygons";
 type Random = () => number;
 type PlacementAttempt = {
   placed: Track[];
+  fixedCount: number;
   candidatesEvaluated: number;
   rejectedReasons: Record<string, number>;
 };
@@ -27,16 +28,18 @@ export function autoPlaceTracks(project: ProjectSnapshot, options: PlacementOpti
     shuffleDeterministic(candidates, options.seed + 17)
   ];
   const best = attempts.map((attempt) => placeGreedy(project, options, attempt)).sort((a, b) => scoreAttempt(b) - scoreAttempt(a))[0] ?? {
-    placed: [],
+    placed: options.fixedTracks ?? [],
+    fixedCount: options.fixedTracks?.length ?? 0,
     candidatesEvaluated: 0,
     rejectedReasons: {}
   };
+  const fixedCount = best.fixedCount;
 
   return {
     labelDa: "Bedste fundne forslag",
     tracks: best.placed,
     requestedTrackCount: options.requestedTrackCount,
-    placedTrackCount: best.placed.length,
+    placedTrackCount: Math.max(0, best.placed.length - fixedCount),
     durationMs: Math.max(1, Math.round(performance.now() - startedAt)),
     score: scoreAttempt(best),
     candidatesEvaluated: best.candidatesEvaluated,
@@ -46,11 +49,13 @@ export function autoPlaceTracks(project: ProjectSnapshot, options: PlacementOpti
 
 function placeGreedy(project: ProjectSnapshot, options: PlacementOptions, candidates: Track[]): PlacementAttempt {
   const rejectedReasons: Record<string, number> = {};
-  const placed: Track[] = [];
+  const fixedTracks = options.fixedTracks ?? [];
+  const fixedCount = fixedTracks.length;
+  const placed: Track[] = [...fixedTracks];
   let candidatesEvaluated = 0;
 
   for (const candidate of candidates) {
-    if (placed.length >= options.requestedTrackCount) break;
+    if (placed.length - fixedCount >= options.requestedTrackCount) break;
     candidatesEvaluated += 1;
     const result = validateTrack(candidate, project.template, {
       fieldPolygon: project.field.polygon,
@@ -69,13 +74,13 @@ function placeGreedy(project: ProjectSnapshot, options: PlacementOptions, candid
     rejectedReasons[firstError] = (rejectedReasons[firstError] ?? 0) + 1;
   }
 
-  return { placed, candidatesEvaluated, rejectedReasons };
+  return { placed, fixedCount, candidatesEvaluated, rejectedReasons };
 }
 
 function scoreAttempt(attempt: PlacementAttempt): number {
-  const placed = attempt.placed;
+  const placed = attempt.placed.slice(attempt.fixedCount);
   const spacingBonus = placed.reduce((sum, track, index) => {
-    const previous = placed.slice(0, index);
+    const previous = attempt.placed.slice(0, attempt.fixedCount + index);
     if (previous.length === 0) {
       return sum;
     }

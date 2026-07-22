@@ -373,6 +373,28 @@ describe("validering og placering", () => {
     expect(validateProject({ ...project, tracks: result.tracks }).valid).toBe(true);
     expect(result.tracks.every((track) => Math.abs(calculateTrackLength(track) - longerBTemplate.lengthMeters) < 0.001)).toBe(true);
   });
+
+  it("kan placere nye spor uden om eksisterende faste spor", () => {
+    const project = createDemoProject("fixed-track");
+    const fixedTrack = project.tracks[0];
+    const result = autoPlaceTracks({ ...project, tracks: [fixedTrack] }, {
+      requestedTrackCount: 1,
+      fixedTracks: [fixedTrack],
+      edgeMarginMeters: 8,
+      minimumTrackSpacingMeters: 15,
+      preferredDirectionDegrees: 0,
+      allowMirror: true,
+      alternateStartDirections: true,
+      placeInRows: true,
+      sameShape: false,
+      varySegmentLengths: true,
+      seed: 123
+    });
+
+    expect(result.placedTrackCount).toBe(1);
+    expect(result.tracks).toHaveLength(2);
+    expect(validateProject({ ...project, tracks: result.tracks }).valid).toBe(true);
+  });
 });
 
 function lineTrack(id: string, points: Track["points"]): Track {

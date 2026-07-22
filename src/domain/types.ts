@@ -218,6 +218,7 @@ export type TrackCandidateShape = {
 
 export type PlacementOptions = {
   requestedTrackCount: number;
+  fixedTracks?: Track[];
   edgeMarginMeters: number;
   minimumTrackSpacingMeters: number;
   preferredDirectionDegrees: number;

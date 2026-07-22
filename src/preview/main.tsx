@@ -2,14 +2,24 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import L from "leaflet";
 import "./preview.css";
-import type { Coordinate, FieldBackgroundImage, PlacementOptions, ProjectSnapshot, Track, TrackTemplateRules, TurnDirection, ValidationMessage } from "@/domain/types";
+import type {
+  Coordinate,
+  FieldBackgroundImage,
+  PlacementOptions,
+  ProjectSnapshot,
+  ProjectValidationResult,
+  Track,
+  TrackTemplateRules,
+  TurnDirection,
+  ValidationMessage
+} from "@/domain/types";
 import { createDemoProject } from "@/domain/demo-data";
 import { dchTrackTemplates } from "@/domain/rules/templates";
 import { createTrackFromShape } from "@/domain/track/create-track";
 import { validateProject } from "@/domain/validation/validation";
 import { autoPlaceTracks } from "@/geometry/placement/auto-placement";
 import { polygonBounds, calculatePolygonArea, calculatePolygonPerimeter } from "@/geometry/polygons";
-import { calculateSegmentLengths, calculateTrackLength, coordinateAtDistance } from "@/geometry/polylines";
+import { calculateSegmentLengths, calculateTrackLength, calculateTurnAngles, coordinateAtDistance } from "@/geometry/polylines";
 import { mirrorTrack, rotatePoint, rotateTrack, translateTrack } from "@/geometry/transforms";
 import { createMapReference, latLonToLocalMeters } from "@/geometry/map-projection";
 import { projectToGeoJson, projectToSvg } from "@/domain/export/exporters";
@@ -18,6 +28,25 @@ import { formatHectares, formatMeters, formatSquareMeters, metersToSteps, parseA
 type GeocodeResult = { label: string; lat: number; lon: number };
 type SnapshotVersion = { id: string; label: string; snapshot: ProjectSnapshot; createdAt: string };
 type ViewBoxState = { x: number; y: number; width: number; height: number };
+type DownloadFormat = "svg" | "geojson" | "json" | "sheet-html" | "sheet-md";
+type FocusTarget = { position: Coordinate; label: string; trackId?: string } | null;
+type RuleStatus = "ok" | "warning" | "error";
+type RuleCheck = {
+  id: string;
+  label: string;
+  status: RuleStatus;
+  value: string;
+  detail: string;
+  position?: Coordinate;
+  trackId?: string;
+};
+type PlacementReport = {
+  result: ReturnType<typeof autoPlaceTracks>;
+  mode: "requested" | "maximum" | "mixed";
+  directionDegrees: number;
+  triedDirections: number[];
+  summary: string;
+};
 type TrackProfile = {
   code: string;
   label: string;
@@ -83,10 +112,16 @@ function PreviewApp() {
   const [polygonStatus, setPolygonStatus] = useState("Polygonen kan indsættes som koordinater, JSON eller GeoJSON.");
   const [rotationStepDegrees, setRotationStepDegrees] = useState(5);
   const [fieldRotationStepDegrees, setFieldRotationStepDegrees] = useState(5);
+  const [rotationNudgeDegrees, setRotationNudgeDegrees] = useState(2.5);
+  const [autoDirectionDegrees, setAutoDirectionDegrees] = useState(0);
+  const [autoKeepExisting, setAutoKeepExisting] = useState(false);
+  const [mixedCounts, setMixedCounts] = useState<Record<string, number>>({ DCH_B: 2, DCH_A: 0, DCH_E: 0 });
   const [activeTemplateCode, setActiveTemplateCode] = useState("DCH_B");
   const [viewBox, setViewBox] = useState<ViewBoxState>(() => viewBoxForProject(createDemoProject("preview-project")));
   const [showRuleGuides, setShowRuleGuides] = useState(false);
   const [showIssueLabels, setShowIssueLabels] = useState(false);
+  const [focusTarget, setFocusTarget] = useState<FocusTarget>(null);
+  const [lastPlacementReport, setLastPlacementReport] = useState<PlacementReport | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const requestedTrackCountRef = useRef<HTMLInputElement | null>(null);
 
@@ -95,6 +130,11 @@ function PreviewApp() {
   const selectedTrack = project.tracks.find((track) => track.id === selectedTrackIds[selectedTrackIds.length - 1]) ?? project.tracks[0];
   const activeProfile = resolveTrackProfile(activeTemplateCode, project);
   const suggestedTrackCount = estimateTrackCapacity(project, activeProfile.template);
+  const fieldAngleDegrees = fieldPrimaryAngle(project.field.polygon);
+  const selectedTrackRuleChecks = useMemo(
+    () => (selectedTrack ? buildTrackRuleChecks(project, selectedTrack, validation) : []),
+    [project, selectedTrack, validation]
+  );
 
   function commit(next: ProjectSnapshot, text = "Ændring gemt i preview-state") {
     setProject({ ...next, templates: next.templates ?? dchTrackTemplates, updatedAt: new Date().toISOString(), version: next.version + 1 });
@@ -192,26 +232,122 @@ function PreviewApp() {
     setSelectedTrackIds(copies.map((track) => track.id));
   }
 
-  function runAutoPlacement() {
-    const requestedTrackCount = normalizeTrackCount(Number(requestedTrackCountRef.current?.value ?? project.requestedTrackCount));
+  function createPlacementOptions(
+    requestedTrackCount: number,
+    fixedTracks: Track[],
+    directionDegrees: number,
+    template: TrackTemplateRules
+  ): PlacementOptions {
+    return {
+      requestedTrackCount,
+      fixedTracks,
+      edgeMarginMeters: project.edgeMarginMeters,
+      minimumTrackSpacingMeters: Math.max(project.minimumTrackSpacingMeters, template.minTrackSpacingMeters),
+      preferredDirectionDegrees: directionDegrees,
+      allowMirror: true,
+      alternateStartDirections: true,
+      placeInRows: true,
+      sameShape: false,
+      varySegmentLengths: true,
+      seed: 42
+    };
+  }
+
+  function findBestPlacement(
+    placementProject: ProjectSnapshot,
+    requestedTrackCount: number,
+    fixedTracks: Track[],
+    mode: PlacementReport["mode"]
+  ): PlacementReport {
+    const directions = uniqueDirections([autoDirectionDegrees, fieldAngleDegrees, 0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165]);
+    const attempts = directions.map((directionDegrees) => {
+      const result = autoPlaceTracks(placementProject, createPlacementOptions(requestedTrackCount, fixedTracks, directionDegrees, placementProject.template));
+      return { result, directionDegrees };
+    });
+    const best = attempts.sort((a, b) => {
+      if (b.result.placedTrackCount !== a.result.placedTrackCount) {
+        return b.result.placedTrackCount - a.result.placedTrackCount;
+      }
+      return b.result.score - a.result.score;
+    })[0];
+    const rejectedSummary = summarizeRejectedReasons(best.result.rejectedReasons);
+
+    return {
+      result: { ...best.result, tracks: relabelTracks(best.result.tracks) },
+      mode,
+      directionDegrees: best.directionDegrees,
+      triedDirections: directions,
+      summary: rejectedSummary || "Alle valgte spor kunne placeres uden regelbrud."
+    };
+  }
+
+  function applyPlacementReport(placementProject: ProjectSnapshot, report: PlacementReport, text: string) {
+    setLastPlacementReport(report);
+    commit({ ...placementProject, tracks: report.result.tracks }, text);
+    const firstNewTrack = report.result.tracks[autoKeepExisting ? project.tracks.length : 0] ?? report.result.tracks[0];
+    setSelectedTrackIds(firstNewTrack ? [firstNewTrack.id] : []);
+  }
+
+  function runAutoPlacement(mode: "requested" | "maximum" = "requested") {
+    const requestedTrackCount =
+      mode === "maximum" ? 1000 : normalizeTrackCount(Number(requestedTrackCountRef.current?.value ?? project.requestedTrackCount));
+    const fixedTracks = autoKeepExisting ? project.tracks : [];
     const placementProject = withActiveTemplate({ ...project, requestedTrackCount }, activeProfile.template);
-    setStage("Automatisk placering beregner kandidater ...");
+    setStage(mode === "maximum" ? "Finder maks antal lovlige spor ..." : "Automatisk placering prøver flere retninger ...");
     window.setTimeout(() => {
-      const options: PlacementOptions = {
-        requestedTrackCount,
-        edgeMarginMeters: project.edgeMarginMeters,
-        minimumTrackSpacingMeters: Math.max(project.minimumTrackSpacingMeters, activeProfile.template.minTrackSpacingMeters),
-        preferredDirectionDegrees: 0,
-        allowMirror: true,
-        alternateStartDirections: true,
-        placeInRows: true,
-        sameShape: false,
-        varySegmentLengths: true,
-        seed: 42
+      const report = findBestPlacement(placementProject, requestedTrackCount, fixedTracks, mode);
+      const placedText =
+        mode === "maximum"
+          ? `${report.result.placedTrackCount} nye spor fundet som maks`
+          : `${report.result.placedTrackCount}/${report.result.requestedTrackCount} nye spor placeret`;
+      applyPlacementReport(placementProject, report, `${placedText} · retning ${formatDegrees(report.directionDegrees)}`);
+    }, 80);
+  }
+
+  function runMixedPlacement() {
+    const entries = trackProfiles
+      .map((profile) => ({ profile, count: normalizeOptionalTrackCount(Number(mixedCounts[profile.code] ?? 0)) }))
+      .filter((entry) => entry.count > 0);
+
+    if (entries.length === 0) {
+      setStage("Vælg mindst én B/A/E-type til mix.");
+      return;
+    }
+
+    setStage("Autoplacerer B/A/E-mix ...");
+    window.setTimeout(() => {
+      let placed = autoKeepExisting ? relabelTracks(project.tracks) : [];
+      const reports: string[] = [];
+      let nextProject = { ...project, tracks: placed, templates: project.templates ?? dchTrackTemplates };
+
+      entries.forEach(({ profile, count }) => {
+        const resolvedProfile = resolveTrackProfile(profile.code, nextProject);
+        const placementProject = withActiveTemplate({ ...nextProject, requestedTrackCount: count }, resolvedProfile.template);
+        const report = findBestPlacement(placementProject, count, placed, "mixed");
+        placed = relabelTracks(report.result.tracks);
+        nextProject = { ...placementProject, tracks: placed };
+        reports.push(`${resolvedProfile.label}: ${report.result.placedTrackCount}/${count}`);
+      });
+
+      const finalReport: PlacementReport = {
+        result: {
+          labelDa: "Bedste fundne forslag",
+          tracks: placed,
+          requestedTrackCount: entries.reduce((sum, entry) => sum + entry.count, 0),
+          placedTrackCount: placed.length - (autoKeepExisting ? project.tracks.length : 0),
+          durationMs: 1,
+          score: placed.length,
+          candidatesEvaluated: 0,
+          rejectedReasons: {}
+        },
+        mode: "mixed",
+        directionDegrees: autoDirectionDegrees,
+        triedDirections: [],
+        summary: reports.join(" · ")
       };
-      const result = autoPlaceTracks(placementProject, options);
-      commit({ ...placementProject, tracks: result.tracks }, `${result.placedTrackCount}/${result.requestedTrackCount} spor placeret`);
-      setSelectedTrackIds(result.tracks[0] ? [result.tracks[0].id] : []);
+      setLastPlacementReport(finalReport);
+      commit({ ...nextProject, tracks: placed }, `Mix placeret: ${reports.join(" · ")}`);
+      setSelectedTrackIds(placed[0] ? [placed[0].id] : []);
     }, 80);
   }
 
@@ -250,6 +386,51 @@ function PreviewApp() {
       },
       "Testfejl: spor for tæt på skel"
     );
+  }
+
+  function focusRule(check: RuleCheck) {
+    if (!check.position) {
+      setStage(check.detail);
+      return;
+    }
+
+    if (check.trackId) {
+      setSelectedTrackIds([check.trackId]);
+    }
+    setFocusTarget({ position: check.position, label: check.label, trackId: check.trackId });
+    const size = Math.max(70, Math.min(viewBox.width, viewBox.height) * 0.45);
+    setViewBox({ x: check.position.x - size / 2, y: check.position.y - size / 2, width: size, height: size });
+    setStage(check.detail);
+  }
+
+  function focusTrack(track: Track) {
+    const center = trackCenter(track);
+    setSelectedTrackIds([track.id]);
+    setFocusTarget({ position: center, label: track.name, trackId: track.id });
+    setViewBox(viewBoxForPoints(track.points, 36));
+    setStage(`${track.name} markeret`);
+  }
+
+  function rotateSelectedByNudge() {
+    rotateSelectedBy(rotationNudgeDegrees);
+  }
+
+  function alignSelectedToField() {
+    const targetDegrees = fieldPrimaryAngle(project.field.polygon);
+    transformSelected((track) => rotateTrack(track, signedAngleDelta(track.rotationDegrees, targetDegrees), trackCenter(track)), `Markerede spor rettet til markretning ${formatDegrees(targetDegrees)}`);
+  }
+
+  function saveFieldVariant() {
+    setVersions((current) => [
+      {
+        id: crypto.randomUUID(),
+        label: `Markvariant ${current.length + 1}`,
+        snapshot: project,
+        createdAt: new Date().toISOString()
+      },
+      ...current
+    ]);
+    setStage("Markvariant gemt i versioner");
   }
 
   async function uploadBackground(file?: File) {
@@ -397,16 +578,28 @@ function PreviewApp() {
     setStage(`${version.label} gendannet`);
   }
 
-  function download(format: "svg" | "geojson" | "json") {
+  function download(format: DownloadFormat) {
     const measuredProject = projectWithMeasuredTracks(project);
     const content =
       format === "svg"
         ? projectToSvg(measuredProject)
         : format === "geojson"
           ? JSON.stringify(projectToGeoJson(measuredProject), null, 2)
-          : JSON.stringify(measuredProject, null, 2);
-    const type = format === "svg" ? "image/svg+xml" : "application/json";
-    downloadBlob(content, `${project.name}.${format}`, type);
+          : format === "sheet-html"
+            ? projectToTrackSheetHtml(measuredProject)
+            : format === "sheet-md"
+              ? projectToTrackSheetMarkdown(measuredProject)
+              : JSON.stringify(measuredProject, null, 2);
+    const type =
+      format === "svg"
+        ? "image/svg+xml"
+        : format === "sheet-html"
+          ? "text/html"
+          : format === "sheet-md"
+            ? "text/markdown"
+            : "application/json";
+    const extension = format === "sheet-html" ? "html" : format === "sheet-md" ? "md" : format;
+    downloadBlob(content, `${project.name}.${extension}`, type);
   }
 
   function onPointerMove(event: React.PointerEvent<SVGSVGElement>) {
@@ -534,6 +727,10 @@ function PreviewApp() {
               <button onClick={() => rotateFieldBy(-fieldRotationStepDegrees)}>- Rotér mark</button>
               <button onClick={() => rotateFieldBy(fieldRotationStepDegrees)}>+ Rotér mark</button>
             </div>
+            <div className="two">
+              <button onClick={() => setAutoDirectionDegrees(fieldAngleDegrees)}>Brug markretning</button>
+              <button onClick={saveFieldVariant}>Gem markvariant</button>
+            </div>
             <label>
               Markrotationstrin
               <input
@@ -544,6 +741,7 @@ function PreviewApp() {
                 onChange={(event) => setFieldRotationStepDegrees(Math.max(0.5, Number(event.currentTarget.value) || 0.5))}
               />
             </label>
+            <div className="message warning">Markretning: {formatDegrees(fieldAngleDegrees)}. Brug den som startretning, når spor skal følge markens lange side.</div>
             <label>
               Indsæt markpolygon
               <textarea
@@ -590,29 +788,73 @@ function PreviewApp() {
               <span>Forslag ud fra markareal</span>
               <strong>{suggestedTrackCount} spor</strong>
             </div>
-            <button
-              onClick={() => {
-                if (requestedTrackCountRef.current) {
-                  requestedTrackCountRef.current.value = String(suggestedTrackCount);
-                }
-                setStage(`Forslag sat til ${suggestedTrackCount} spor`);
-              }}
-            >
-              Brug forslag
-            </button>
             <div className="two">
-              <button onClick={addTrack}>Tilføj spor</button>
+              <button
+                onClick={() => {
+                  if (requestedTrackCountRef.current) {
+                    requestedTrackCountRef.current.value = String(suggestedTrackCount);
+                  }
+                  setStage(`Forslag sat til ${suggestedTrackCount} spor`);
+                }}
+              >
+                Brug forslag
+              </button>
+              <button onClick={() => runAutoPlacement("maximum")}>Placer maks</button>
+            </div>
+            <label>
+              Auto-retning
+              <input
+                type="number"
+                step="1"
+                value={autoDirectionDegrees}
+                onChange={(event) => setAutoDirectionDegrees(normalizeDegrees(Number(event.currentTarget.value) || 0))}
+              />
+            </label>
+            <label className="inline-check">
+              <input type="checkbox" checked={autoKeepExisting} onChange={(event) => setAutoKeepExisting(event.currentTarget.checked)} />
+              Behold eksisterende spor og læg nye udenom
+            </label>
+            <div className="two">
+              <button onClick={addTrack}>Tilføj valgt</button>
+              <button className="primary" onClick={() => runAutoPlacement("requested")}>
+                Autoplacer valgt
+              </button>
               <button onClick={createCrossingExample}>Lav kryds</button>
               <button onClick={createBoundaryExample}>For tæt på skel</button>
               <button onClick={() => setStage(validation.valid ? "Projektet er gyldigt" : `${validation.errors.length} fejl fundet`)}>
                 Validér
               </button>
             </div>
+            <div className="mix-panel">
+              <h3>B/A/E-mix</h3>
+              <div className="three">
+                {trackProfiles.map((profile) => (
+                  <label key={profile.code}>
+                    {profile.label}
+                    <input
+                      type="number"
+                      min="0"
+                      max="1000"
+                      value={mixedCounts[profile.code] ?? 0}
+                      onChange={(event) => {
+                        const nextCount = normalizeOptionalTrackCount(Number(event.currentTarget.value));
+                        setMixedCounts((current) => ({ ...current, [profile.code]: nextCount }));
+                      }}
+                    />
+                  </label>
+                ))}
+              </div>
+              <button className="primary" onClick={runMixedPlacement}>
+                Autoplacer mix
+              </button>
+            </div>
+            {lastPlacementReport ? <PlacementSummary report={lastPlacementReport} /> : null}
             <div className="scroll stack">
               {project.tracks.map((track) => (
                 <button
                   key={track.id}
                   className={`track-row ${selectedTrackIds.includes(track.id) ? "active" : ""}`}
+                  onDoubleClick={() => focusTrack(track)}
                   onClick={(event) => selectTrack(track.id, event.shiftKey || event.metaKey || event.ctrlKey)}
                 >
                   <span>{track.name}</span>
@@ -690,6 +932,7 @@ function PreviewApp() {
                   }}
                 />
               ))}
+              {focusTarget ? <FocusMarker target={focusTarget} viewBox={viewBox} /> : null}
               {showIssueLabels ? <IssueLabels messages={messages} /> : null}
               <ScaleBar viewBox={viewBox} />
             </svg>
@@ -725,6 +968,7 @@ function PreviewApp() {
               <button onClick={() => transformSelected((track) => mirrorTrack(track, "y"), "Spor spejlvendt")}>Spejlvend</button>
               <button onClick={() => rotateSelectedBy(-rotationStepDegrees)}>- Rotér</button>
               <button onClick={() => rotateSelectedBy(rotationStepDegrees)}>+ Rotér</button>
+              <button onClick={alignSelectedToField}>Ret til mark</button>
               <button className="danger" onClick={deleteSelected}>
                 Slet
               </button>
@@ -739,6 +983,37 @@ function PreviewApp() {
                 onChange={(event) => setRotationStepDegrees(Math.max(0.5, Number(event.currentTarget.value) || 0.5))}
               />
             </label>
+            <label>
+              Finrotation
+              <input
+                type="range"
+                min="-15"
+                max="15"
+                step="0.5"
+                value={rotationNudgeDegrees}
+                onChange={(event) => setRotationNudgeDegrees(Number(event.currentTarget.value))}
+              />
+            </label>
+            <div className="two">
+              <button onClick={rotateSelectedByNudge}>Anvend {formatSignedDegrees(rotationNudgeDegrees)}</button>
+              <button onClick={() => setRotationNudgeDegrees(0)}>Nulstil trin</button>
+            </div>
+            <div className="quick-buttons">
+              {[0.5, 1, 2.5, 5, 10].map((value) => (
+                <button key={value} onClick={() => setRotationStepDegrees(value)}>
+                  {value}°
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="section stack">
+            <h2>Regelstatus</h2>
+            {selectedTrack ? (
+              <RuleStatusPanel track={selectedTrack} checks={selectedTrackRuleChecks} onFocus={focusRule} />
+            ) : (
+              <div className="message warning">Vælg et spor for at se regelstatus.</div>
+            )}
           </section>
 
           <section className="section stack">
@@ -758,7 +1033,8 @@ function PreviewApp() {
               <button onClick={() => download("svg")}>SVG</button>
               <button onClick={() => download("geojson")}>GeoJSON</button>
               <button onClick={() => download("json")}>Projekt JSON</button>
-              <button onClick={() => download("svg")}>PDF/SVG-ark</button>
+              <button onClick={() => download("sheet-html")}>Sporlæggerark</button>
+              <button onClick={() => download("sheet-md")}>Markdownark</button>
             </div>
           </section>
         </aside>
@@ -835,6 +1111,63 @@ function TrackSvg({ track, selected, onPointerDown }: { track: Track; selected: 
         );
       })}
     </g>
+  );
+}
+
+function FocusMarker({ target, viewBox }: { target: NonNullable<FocusTarget>; viewBox: ViewBoxState }) {
+  const radius = Math.max(6, viewBox.width / 42);
+  const textSize = Math.max(4.5, viewBox.width / 78);
+
+  return (
+    <g pointerEvents="none">
+      <circle cx={target.position.x} cy={target.position.y} r={radius} fill="none" stroke="#16201b" strokeWidth={Math.max(1, viewBox.width / 260)} opacity={0.82} />
+      <circle cx={target.position.x} cy={target.position.y} r={radius * 0.55} fill="none" stroke="#ffffff" strokeWidth={Math.max(0.8, viewBox.width / 420)} opacity={0.9} />
+      <text x={target.position.x + radius * 1.2} y={target.position.y - radius * 0.85} fill="#16201b" fontSize={textSize} fontWeight="700">
+        {target.label}
+      </text>
+    </g>
+  );
+}
+
+function RuleStatusPanel({ track, checks, onFocus }: { track: Track; checks: RuleCheck[]; onFocus: (check: RuleCheck) => void }) {
+  const errors = checks.filter((check) => check.status === "error").length;
+  const warnings = checks.filter((check) => check.status === "warning").length;
+
+  return (
+    <div className="stack">
+      <div className={`rule-summary ${errors > 0 ? "error" : warnings > 0 ? "warning" : "ok"}`}>
+        <strong>{track.name}</strong>
+        <span>{errors > 0 ? `${errors} fejl` : warnings > 0 ? `${warnings} advarsler` : "Alle hovedregler ok"}</span>
+      </div>
+      <div className="rule-list">
+        {checks.map((check) => (
+          <button key={check.id} className={`rule-row ${check.status}`} onClick={() => onFocus(check)}>
+            <span className="status-dot" />
+            <span>
+              <strong>{check.label}</strong>
+              <small>{check.detail}</small>
+            </span>
+            <em>{check.value}</em>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PlacementSummary({ report }: { report: PlacementReport }) {
+  return (
+    <div className="placement-summary">
+      <div className="toolbar">
+        <strong>{report.mode === "maximum" ? "Maksforslag" : report.mode === "mixed" ? "Mixforslag" : "Autoforslag"}</strong>
+        <span>{formatDegrees(report.directionDegrees)}</span>
+      </div>
+      <p>
+        {report.result.placedTrackCount}/{report.result.requestedTrackCount} nye spor · {report.result.tracks.length} i planen
+      </p>
+      <p className="small">{report.summary}</p>
+      {report.triedDirections.length > 0 ? <p className="small">Retninger prøvet: {report.triedDirections.map(formatDegrees).join(", ")}</p> : null}
+    </div>
   );
 }
 
@@ -1241,6 +1574,68 @@ function normalizeTrackCount(value: number): number {
   return Math.max(1, Math.min(1000, Math.round(value || 1)));
 }
 
+function normalizeOptionalTrackCount(value: number): number {
+  return Math.max(0, Math.min(1000, Math.round(Number.isFinite(value) ? value : 0)));
+}
+
+function normalizeDegrees(value: number): number {
+  return ((value % 180) + 180) % 180;
+}
+
+function signedAngleDelta(fromDegrees: number, toDegrees: number): number {
+  return ((((toDegrees - fromDegrees) % 360) + 540) % 360) - 180;
+}
+
+function formatDegrees(value: number): string {
+  return `${Number(normalizeDegrees(value).toFixed(1))}°`;
+}
+
+function formatSignedDegrees(value: number): string {
+  return `${Number(value.toFixed(1))}°`;
+}
+
+function uniqueDirections(values: number[]): number[] {
+  return [...new Set(values.map((value) => normalizeDegrees(Math.round(value))))];
+}
+
+function summarizeRejectedReasons(rejectedReasons: Record<string, number>): string {
+  const labels: Record<string, string> = {
+    OUTSIDE_FIELD: "uden for marken",
+    EDGE_MARGIN: "for tæt på skel",
+    TRACK_INTERSECTION: "krydsede andre spor",
+    TRACK_SPACING: "for tæt på andre spor",
+    RESTRICTED_AREA: "ramte forbudt område",
+    MIDDLE_SEGMENT_LENGTH: "havde for korte ben mellem knæk",
+    TURN_ANGLE: "havde forkerte knæk"
+  };
+  const entries = Object.entries(rejectedReasons).sort((a, b) => b[1] - a[1]).slice(0, 3);
+
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return `Afviste kandidater især fordi de ${entries.map(([code, count]) => `${labels[code] ?? code} (${count})`).join(", ")}.`;
+}
+
+function fieldPrimaryAngle(polygon: Coordinate[]): number {
+  if (polygon.length < 2) {
+    return 0;
+  }
+
+  let longest = { length: 0, angle: 0 };
+  for (let index = 0; index < polygon.length; index += 1) {
+    const start = polygon[index];
+    const end = polygon[(index + 1) % polygon.length];
+    const length = Math.hypot(end.x - start.x, end.y - start.y);
+
+    if (length > longest.length) {
+      longest = { length, angle: (Math.atan2(end.y - start.y, end.x - start.x) * 180) / Math.PI };
+    }
+  }
+
+  return normalizeDegrees(longest.angle);
+}
+
 function resolveTrackProfile(code: string, project: ProjectSnapshot): TrackProfile {
   const baseProfile = trackProfiles.find((profile) => profile.code === code) ?? trackProfiles[0];
   const template =
@@ -1253,6 +1648,98 @@ function resolveTrackProfile(code: string, project: ProjectSnapshot): TrackProfi
     template,
     segmentLengthsMeters: scaledSegments(baseProfile.segmentLengthsMeters, template.lengthMeters)
   };
+}
+
+function rulesForTrack(project: ProjectSnapshot, track: Track): TrackTemplateRules {
+  if (!track.templateCode || track.templateCode === project.template.code) {
+    return project.template;
+  }
+
+  return project.templates?.find((template) => template.code === track.templateCode) ?? project.template;
+}
+
+function buildTrackRuleChecks(project: ProjectSnapshot, track: Track, validation: ProjectValidationResult): RuleCheck[] {
+  const rules = rulesForTrack(project, track);
+  const result = validation.tracks[track.id];
+  const messages = [...(result?.errors ?? []), ...(result?.warnings ?? [])];
+  const measurements = result?.measurements;
+  const expectedAngles = rules.turnAnglesDegrees ?? Array.from({ length: rules.turnCount }, () => rules.turnAngleDegrees);
+  const turnAngles = measurements?.turnAnglesDegrees ?? calculateTurnAngles(track.points);
+  const segmentLengths = measurements?.segmentLengthsMeters ?? calculateSegmentLengths(track.points);
+  const lengthMeters = measurements?.totalLengthMeters ?? calculateTrackLength(track);
+  const nearestBoundary = measurements?.nearestBoundaryDistanceMeters;
+  const nearestTrack = measurements?.nearestTrackDistanceMeters;
+
+  return [
+    ruleCheck("length", "Længde", ["TRACK_LENGTH"], messages, track, {
+      value: `${formatMeters(lengthMeters)} / ${formatMeters(rules.lengthMeters)}`,
+      detail: `Tolerance ${formatMeters(rules.lengthToleranceMeters)}`
+    }),
+    ruleCheck("turns", "Knæk", ["TRACK_POINT_COUNT", "SEGMENT_COUNT", "TURN_ANGLE"], messages, track, {
+      value: turnAngles.map((angle) => `${Math.round(angle)}°`).join(" · ") || "-",
+      detail: `Krav: ${expectedAngles.map((angle) => `${angle}°`).join(" · ")}`
+    }),
+    ruleCheck("middle", "Ben mellem knæk", ["MIDDLE_SEGMENT_LENGTH"], messages, track, {
+      value: segmentLengths.slice(1, -1).map((length) => formatMeters(length)).join(" · ") || "-",
+      detail: `Minimum ${formatMeters(rules.minMiddleSegmentMeters)}`
+    }),
+    ruleCheck("field", "Mark og skel", ["OUTSIDE_FIELD", "EDGE_MARGIN"], messages, track, {
+      value: nearestBoundary === undefined ? "-" : formatMeters(nearestBoundary),
+      detail: `Kantmargin ${formatMeters(project.edgeMarginMeters)}`
+    }),
+    ruleCheck("spacing", "Afstand/kryds", ["TRACK_INTERSECTION", "TRACK_SPACING", "SELF_INTERSECTION"], messages, track, {
+      value: nearestTrack === undefined ? "Ingen nabo" : formatMeters(nearestTrack),
+      detail: `Minimum ${formatMeters(project.minimumTrackSpacingMeters)} mellem spor`
+    }),
+    ruleCheck("objects", "Genstande", ["OBJECT_COUNT", "OBJECT_TOO_CLOSE_TO_FINISH"], messages, track, {
+      value: `${track.objects.length}/${rules.objectCount}`,
+      detail: `Øvrige genstande skal ligge mindst ${formatMeters(rules.minLastObjectToFinishMeters)} før slut`
+    }),
+    ruleCheck("restricted", "Forbudte områder", ["RESTRICTED_AREA"], messages, track, {
+      value: project.restrictedAreas.filter((area) => area.active).length === 0 ? "Ingen" : `${project.restrictedAreas.filter((area) => area.active).length} aktive`,
+      detail: "Sporet må ikke ramme aktive forbudszoner"
+    })
+  ];
+}
+
+function ruleCheck(
+  id: string,
+  label: string,
+  codes: string[],
+  messages: ValidationMessage[],
+  track: Track,
+  fallback: { value: string; detail: string }
+): RuleCheck {
+  const matching = messages.find((message) => codes.includes(message.code));
+
+  if (!matching) {
+    return {
+      id,
+      label,
+      status: "ok",
+      value: fallback.value,
+      detail: fallback.detail,
+      position: trackCenter(track),
+      trackId: track.id
+    };
+  }
+
+  return {
+    id,
+    label,
+    status: matching.severity === "error" ? "error" : "warning",
+    value:
+      matching.actualValue !== undefined && matching.requiredValue !== undefined
+        ? `${Number(matching.actualValue.toFixed(1))}/${Number(matching.requiredValue.toFixed(1))} ${matching.unit ?? ""}`.trim()
+        : fallback.value,
+    detail: matching.messageDa,
+    position: matching.position ?? trackCenter(track),
+    trackId: track.id
+  };
+}
+
+function relabelTracks(tracks: Track[]): Track[] {
+  return tracks.map((track, index) => ({ ...track, displayNo: index + 1, name: renameTrack(track, index + 1) }));
 }
 
 function scaledSegments(segments: number[], targetLengthMeters: number): number[] {
@@ -1312,6 +1799,116 @@ function projectWithMeasuredTracks(project: ProjectSnapshot): ProjectSnapshot {
       };
     })
   };
+}
+
+function projectToTrackSheetMarkdown(project: ProjectSnapshot): string {
+  const validation = validateProject(project);
+  const lines = [
+    `# Sporlæggerark - ${project.name}`,
+    "",
+    `Klub: ${project.club || "-"}`,
+    `Arrangement: ${project.eventName || "-"}`,
+    `Mark: ${project.field.name}`,
+    `Areal: ${formatSquareMeters(project.field.areaM2)} / ${formatHectares(project.field.areaM2)}`,
+    `Spor i planen: ${project.tracks.length}`,
+    `Validering: ${validation.valid ? "Gyldig" : `${validation.errors.length} fejl og ${validation.warnings.length} advarsler`}`,
+    "",
+    "## Spor"
+  ];
+
+  project.tracks.forEach((track) => {
+    const checks = buildTrackRuleChecks(project, track, validation);
+    const segmentLengths = calculateSegmentLengths(track.points);
+    const turnAngles = calculateTurnAngles(track.points);
+    lines.push(
+      "",
+      `### ${track.name}`,
+      `Type: ${rulesForTrack(project, track).name}`,
+      `Længde: ${formatMeters(calculateTrackLength(track))}`,
+      `Segmenter: ${segmentLengths.map((length) => formatMeters(length)).join(" · ")}`,
+      `Knæk: ${turnAngles.map((angle) => `${Math.round(angle)}°`).join(" · ") || "-"}`,
+      `Regelstatus: ${checks.filter((check) => check.status === "error").length} fejl, ${checks.filter((check) => check.status === "warning").length} advarsler`,
+      "Genstande:",
+      ...track.objects.map((object) => `- G${object.displayNo}: ${formatMeters(object.distanceAlongTrackMeters)} fra start, ${object.material}`),
+      "Noter: ________________________________________________"
+    );
+  });
+
+  return lines.join("\n");
+}
+
+function projectToTrackSheetHtml(project: ProjectSnapshot): string {
+  const validation = validateProject(project);
+  const overviewSvg = projectToSvg(project, { width: 1100, height: 700 });
+  const trackSections = project.tracks
+    .map((track) => {
+      const checks = buildTrackRuleChecks(project, track, validation);
+      const segmentLengths = calculateSegmentLengths(track.points);
+      const turnAngles = calculateTurnAngles(track.points);
+      const checkRows = checks
+        .map(
+          (check) =>
+            `<tr><td>${escapeHtml(check.label)}</td><td>${escapeHtml(statusLabel(check.status))}</td><td>${escapeHtml(check.value)}</td><td>${escapeHtml(check.detail)}</td></tr>`
+        )
+        .join("");
+      const objectRows = track.objects
+        .map((object) => `<tr><td>G${object.displayNo}</td><td>${formatMeters(object.distanceAlongTrackMeters)}</td><td>${escapeHtml(object.material)}</td></tr>`)
+        .join("");
+
+      return `<section class="page">
+        <h2>${escapeHtml(track.name)}</h2>
+        <p>${escapeHtml(rulesForTrack(project, track).name)} · ${formatMeters(calculateTrackLength(track))} · ${track.objects.length} genstande</p>
+        <p>Segmenter: ${segmentLengths.map((length) => formatMeters(length)).join(" · ")}</p>
+        <p>Knæk: ${turnAngles.map((angle) => `${Math.round(angle)}°`).join(" · ") || "-"}</p>
+        <h3>Regler</h3>
+        <table><thead><tr><th>Regel</th><th>Status</th><th>Måling</th><th>Detalje</th></tr></thead><tbody>${checkRows}</tbody></table>
+        <h3>Genstande</h3>
+        <table><thead><tr><th>Genstand</th><th>Afstand</th><th>Materiale</th></tr></thead><tbody>${objectRows}</tbody></table>
+        <div class="notes">Noter<br /><br /></div>
+      </section>`;
+    })
+    .join("");
+
+  return `<!doctype html>
+<html lang="da">
+  <head>
+    <meta charset="utf-8" />
+    <title>${escapeHtml(project.name)} - sporlæggerark</title>
+    <style>
+      body { font-family: Arial, sans-serif; color: #16201b; margin: 24px; }
+      h1, h2, h3 { margin: 0 0 8px; }
+      p { margin: 4px 0 10px; }
+      .overview { margin-bottom: 24px; }
+      .overview svg { width: 100%; height: auto; border: 1px solid #d7ded7; }
+      .page { break-before: page; margin-top: 28px; }
+      table { width: 100%; border-collapse: collapse; margin: 10px 0 18px; font-size: 12px; }
+      th, td { border: 1px solid #d7ded7; padding: 6px; text-align: left; vertical-align: top; }
+      th { background: #eef8ee; }
+      .notes { min-height: 90px; border: 1px solid #d7ded7; padding: 8px; }
+      @media print { body { margin: 12mm; } .page { break-before: page; } }
+    </style>
+  </head>
+  <body>
+    <section class="overview">
+      <h1>${escapeHtml(project.name)}</h1>
+      <p>${escapeHtml(project.club || "-")} · ${escapeHtml(project.eventName || "-")} · ${formatSquareMeters(project.field.areaM2)} · ${formatHectares(project.field.areaM2)}</p>
+      ${overviewSvg}
+    </section>
+    ${trackSections}
+  </body>
+</html>`;
+}
+
+function statusLabel(status: RuleStatus): string {
+  return status === "ok" ? "OK" : status === "warning" ? "Advarsel" : "Fejl";
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 function rotateProjectField(project: ProjectSnapshot, angleDegrees: number): ProjectSnapshot {
