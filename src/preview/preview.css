@@ -308,6 +308,7 @@ h3 {
 .mix-panel,
 .measure-card,
 .object-card,
+.capacity-panel,
 .placement-summary,
 .rule-guide-card,
 .rule-summary {
@@ -327,6 +328,94 @@ h3 {
   border-color: #c3d9c5;
   background: #f3faf3;
   font-size: 13px;
+}
+
+.capacity-panel {
+  display: grid;
+  gap: 8px;
+  background: #fbfdfb;
+}
+
+.capacity-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.capacity-card {
+  display: grid;
+  gap: 3px;
+  min-height: 72px;
+  padding: 8px;
+  text-align: left;
+}
+
+.capacity-card.active {
+  border-color: var(--field);
+  background: var(--field-soft);
+}
+
+.capacity-card span,
+.capacity-card small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.placement-health {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px;
+}
+
+.placement-health.ok {
+  border-color: #b7ebc0;
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.placement-health.warning {
+  border-color: #ffe8a1;
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.placement-health.error {
+  border-color: #ffc9c9;
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.placement-health span {
+  font-size: 11px;
+}
+
+.placement-insight-list {
+  display: grid;
+  gap: 5px;
+}
+
+.placement-insight-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  padding: 6px;
+  font-size: 11px;
+}
+
+.placement-insight-row.warning {
+  border-color: #ffe8a1;
+  background: var(--warning-bg);
+}
+
+.placement-insight-row.error {
+  border-color: #ffc9c9;
+  background: var(--error-bg);
 }
 
 .rule-summary {
@@ -460,6 +549,20 @@ h3 {
   gap: 6px;
 }
 
+.nudge-pad,
+.object-nudges {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.nudge-pad button,
+.object-nudges button {
+  min-height: 32px;
+  padding: 6px;
+  font-size: 11px;
+}
+
 .message {
   border: 1px solid #d3f9d8;
   background: var(--ok-bg);
@@ -563,7 +666,10 @@ h3 {
   }
 
   .three,
-  .quick-buttons {
+  .quick-buttons,
+  .capacity-grid,
+  .nudge-pad,
+  .object-nudges {
     grid-template-columns: 1fr;
   }
 }

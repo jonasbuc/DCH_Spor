@@ -36,7 +36,7 @@ import { formatHectares, formatMeters, formatSquareMeters, metersToSteps, parseA
 type GeocodeResult = { label: string; lat: number; lon: number };
 type SnapshotVersion = { id: string; label: string; snapshot: ProjectSnapshot; createdAt: string };
 type ViewBoxState = { x: number; y: number; width: number; height: number };
-type DownloadFormat = "svg" | "geojson" | "json" | "sheet-html" | "sheet-md";
+type DownloadFormat = "svg" | "geojson" | "json" | "sheet-html" | "sheet-md" | "sheet-pdf";
 type FocusTarget = { position: Coordinate; label: string; trackId?: string } | null;
 type RuleStatus = "ok" | "warning" | "error";
 type RuleCheck = {
@@ -54,6 +54,29 @@ type PlacementReport = {
   directionDegrees: number;
   triedDirections: number[];
   summary: string;
+};
+type PlacementInsight = {
+  trackId: string;
+  name: string;
+  status: RuleStatus;
+  position: Coordinate;
+  boundaryDistanceMeters: number;
+  boundaryRequiredMeters: number;
+  nearestTrackDistanceMeters?: number;
+  nearestTrackName?: string;
+  spacingRequiredMeters: number;
+  lengthMeters: number;
+  issueCount: number;
+};
+type CapacityEstimate = {
+  code: string;
+  label: string;
+  suggestedTrackCount: number;
+  optimisticTrackCount: number;
+  usableAreaM2: number;
+  areaPerTrackM2: number;
+  spacingMeters: number;
+  lengthMeters: number;
 };
 type DistanceGuide = {
   id: string;
@@ -155,6 +178,7 @@ function PreviewApp() {
   const [activeTemplateCode, setActiveTemplateCode] = useState("DCH_B");
   const [viewBox, setViewBox] = useState<ViewBoxState>(() => viewBoxForProject(createDemoProject("preview-project")));
   const [showRuleGuides, setShowRuleGuides] = useState(false);
+  const [showPlacementInsights, setShowPlacementInsights] = useState(false);
   const [showIssueLabels, setShowIssueLabels] = useState(false);
   const [focusTarget, setFocusTarget] = useState<FocusTarget>(null);
   const [lastPlacementReport, setLastPlacementReport] = useState<PlacementReport | null>(null);
@@ -168,7 +192,9 @@ function PreviewApp() {
   const messages = useMemo(() => [...validation.errors, ...validation.warnings], [validation]);
   const selectedTrack = project.tracks.find((track) => track.id === selectedTrackIds[selectedTrackIds.length - 1]) ?? project.tracks[0];
   const activeProfile = resolveTrackProfile(activeTemplateCode, project);
-  const suggestedTrackCount = estimateTrackCapacity(project, activeProfile.template);
+  const capacityEstimates = useMemo(() => estimateTrackCapacities(project), [project]);
+  const activeCapacityEstimate = capacityEstimates.find((estimate) => estimate.code === activeTemplateCode) ?? capacityEstimates[0];
+  const suggestedTrackCount = activeCapacityEstimate?.suggestedTrackCount ?? estimateTrackCapacity(project, activeProfile.template);
   const fieldAngleDegrees = fieldPrimaryAngle(project.field.polygon);
   const selectedTrackRuleChecks = useMemo(
     () => (selectedTrack ? buildTrackRuleChecks(project, selectedTrack, validation) : []),
@@ -177,6 +203,10 @@ function PreviewApp() {
   const ruleGuideOverlay = useMemo(
     () => buildRuleGuideOverlay(project, selectedTrackIds, validation),
     [project, selectedTrackIds, validation]
+  );
+  const placementInsights = useMemo(
+    () => (lastPlacementReport ? buildPlacementInsights(project, validation, lastPlacementReport) : []),
+    [lastPlacementReport, project, validation]
   );
   const activeMeasurement = useMemo(() => {
     const start = measurePoints[0];
@@ -232,6 +262,10 @@ function PreviewApp() {
 
   function rotateSelectedBy(angleDegrees: number) {
     transformSelected((track) => rotateTrack(track, angleDegrees, trackCenter(track)), `Markerede spor roteret ${angleDegrees.toFixed(1)}°`);
+  }
+
+  function moveSelectedBy(dx: number, dy: number) {
+    transformSelected((track) => translateTrack(track, dx, dy), `Markerede spor flyttet ${formatMeters(Math.hypot(dx, dy), 1)}`);
   }
 
   function startRotationDrag(event: React.PointerEvent<SVGCircleElement>, trackId: string) {
@@ -392,6 +426,7 @@ function PreviewApp() {
 
   function applyPlacementReport(placementProject: ProjectSnapshot, report: PlacementReport, text: string) {
     setLastPlacementReport(report);
+    setShowPlacementInsights(true);
     commit({ ...placementProject, tracks: report.result.tracks }, text);
     const firstNewTrack = report.result.tracks[autoKeepExisting ? project.tracks.length : 0] ?? report.result.tracks[0];
     setSelectedTrackIds(firstNewTrack ? [firstNewTrack.id] : []);
@@ -698,8 +733,17 @@ function PreviewApp() {
     setStage(`${version.label} gendannet`);
   }
 
-  function download(format: DownloadFormat) {
+  async function download(format: DownloadFormat) {
     const measuredProject = projectWithMeasuredTracks(project);
+
+    if (format === "sheet-pdf") {
+      setStage("Bygger PDF-sporlæggerark ...");
+      const pdfBlob = await projectToTrackSheetPdfBlob(measuredProject);
+      downloadBlob(pdfBlob, `${project.name}-sporlæggerark.pdf`, "application/pdf");
+      setStage("PDF-sporlæggerark hentet");
+      return;
+    }
+
     const content =
       format === "svg"
         ? projectToSvg(measuredProject)
@@ -990,6 +1034,13 @@ function PreviewApp() {
               <span>Forslag ud fra markareal</span>
               <strong>{suggestedTrackCount} spor</strong>
             </div>
+            <CapacityPanel estimates={capacityEstimates} activeCode={activeTemplateCode} onUse={(estimate) => {
+              setActiveTemplateCode(estimate.code);
+              if (requestedTrackCountRef.current) {
+                requestedTrackCountRef.current.value = String(estimate.suggestedTrackCount);
+              }
+              setStage(`${estimate.label}: forslag sat til ${estimate.suggestedTrackCount} spor`);
+            }} />
             <div className="two">
               <button
                 onClick={() => {
@@ -1050,7 +1101,7 @@ function PreviewApp() {
                 Autoplacer mix
               </button>
             </div>
-            {lastPlacementReport ? <PlacementSummary report={lastPlacementReport} /> : null}
+            {lastPlacementReport ? <PlacementSummary report={lastPlacementReport} insights={placementInsights} /> : null}
             <div className="scroll stack">
               {project.tracks.map((track) => (
                 <button
@@ -1086,6 +1137,9 @@ function PreviewApp() {
               <button onClick={() => setViewBox(viewBoxForProject(project))}>Fit alle</button>
               <button className={showRuleGuides ? "primary" : ""} onClick={() => setShowRuleGuides((current) => !current)}>
                 Regelguides
+              </button>
+              <button className={showPlacementInsights ? "primary" : ""} onClick={() => setShowPlacementInsights((current) => !current)}>
+                Autofeedback
               </button>
               <button className={showIssueLabels ? "primary" : ""} onClick={() => setShowIssueLabels((current) => !current)}>
                 Fejllabels
@@ -1124,6 +1178,7 @@ function PreviewApp() {
               {project.field.backgroundImage ? <BackgroundImage image={project.field.backgroundImage} /> : null}
               <polygon points={project.field.polygon.map(pointToSvg).join(" ")} fill="#d9eed9" stroke="#2f6235" strokeWidth={1.6} opacity={0.86} />
               {showRuleGuides ? <RuleGuides project={project} overlay={ruleGuideOverlay} viewBox={viewBox} /> : null}
+              {showPlacementInsights ? <PlacementInsightOverlay insights={placementInsights} project={project} viewBox={viewBox} /> : null}
               {!showIssueLabels ? <IssueMarkers messages={messages} /> : null}
               {project.restrictedAreas.map((area) =>
                 area.type === "polygon" ? (
@@ -1226,6 +1281,18 @@ function PreviewApp() {
                 </button>
               ))}
             </div>
+            <div className="nudge-pad">
+              <button onClick={() => moveSelectedBy(0, -1)}>Op 1 m</button>
+              <button onClick={() => moveSelectedBy(-1, 0)}>Venstre 1 m</button>
+              <button onClick={() => moveSelectedBy(1, 0)}>Højre 1 m</button>
+              <button onClick={() => moveSelectedBy(0, 1)}>Ned 1 m</button>
+            </div>
+            <div className="nudge-pad">
+              <button onClick={() => moveSelectedBy(0, -5)}>Op 5 m</button>
+              <button onClick={() => moveSelectedBy(-5, 0)}>Venstre 5 m</button>
+              <button onClick={() => moveSelectedBy(5, 0)}>Højre 5 m</button>
+              <button onClick={() => moveSelectedBy(0, 5)}>Ned 5 m</button>
+            </div>
             <div className="measure-card">
               <div className="toolbar">
                 <strong>Måling</strong>
@@ -1274,11 +1341,12 @@ function PreviewApp() {
           <section className="section stack">
             <h2>Eksport</h2>
             <div className="two">
-              <button onClick={() => download("svg")}>SVG</button>
-              <button onClick={() => download("geojson")}>GeoJSON</button>
-              <button onClick={() => download("json")}>Projekt JSON</button>
-              <button onClick={() => download("sheet-html")}>Sporlæggerark</button>
-              <button onClick={() => download("sheet-md")}>Markdownark</button>
+              <button onClick={() => void download("svg")}>SVG</button>
+              <button onClick={() => void download("geojson")}>GeoJSON</button>
+              <button onClick={() => void download("json")}>Projekt JSON</button>
+              <button className="primary" onClick={() => void download("sheet-pdf")}>PDF-ark</button>
+              <button onClick={() => void download("sheet-html")}>HTML-ark</button>
+              <button onClick={() => void download("sheet-md")}>Markdownark</button>
             </div>
           </section>
         </aside>
@@ -1516,7 +1584,38 @@ function RuleStatusPanel({ track, checks, onFocus }: { track: Track; checks: Rul
   );
 }
 
-function PlacementSummary({ report }: { report: PlacementReport }) {
+function CapacityPanel({
+  estimates,
+  activeCode,
+  onUse
+}: {
+  estimates: CapacityEstimate[];
+  activeCode: string;
+  onUse: (estimate: CapacityEstimate) => void;
+}) {
+  return (
+    <div className="capacity-panel">
+      <div className="toolbar">
+        <strong>Kapacitet</strong>
+        <span className="small">areal, skel og afstand</span>
+      </div>
+      <div className="capacity-grid">
+        {estimates.map((estimate) => (
+          <button key={estimate.code} className={`capacity-card ${estimate.code === activeCode ? "active" : ""}`} onClick={() => onUse(estimate)}>
+            <strong>{estimate.label}</strong>
+            <span>{estimate.suggestedTrackCount} realistisk</span>
+            <small>op til {estimate.optimisticTrackCount} ved tæt pakning</small>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PlacementSummary({ report, insights }: { report: PlacementReport; insights: PlacementInsight[] }) {
+  const issueCount = insights.reduce((sum, insight) => sum + insight.issueCount, 0);
+  const tightCount = insights.filter((insight) => insight.status === "warning").length;
+
   return (
     <div className="placement-summary">
       <div className="toolbar">
@@ -1528,6 +1627,23 @@ function PlacementSummary({ report }: { report: PlacementReport }) {
       </p>
       <p className="small">{report.summary}</p>
       {report.triedDirections.length > 0 ? <p className="small">Retninger prøvet: {report.triedDirections.map(formatDegrees).join(", ")}</p> : null}
+      <div className={`placement-health ${issueCount > 0 ? "error" : tightCount > 0 ? "warning" : "ok"}`}>
+        <strong>{issueCount > 0 ? `${issueCount} regelbrud` : tightCount > 0 ? `${tightCount} tæt på grænsen` : "Forslaget er rent"}</strong>
+        <span>{report.result.candidatesEvaluated} kandidater vurderet på bedste forsøg</span>
+      </div>
+      {insights.length > 0 ? (
+        <div className="placement-insight-list">
+          {insights.slice(0, 8).map((insight) => (
+            <div key={insight.trackId} className={`placement-insight-row ${insight.status}`}>
+              <strong>{insight.name}</strong>
+              <span>Skel {formatMeters(insight.boundaryDistanceMeters, 1)}</span>
+              <span>
+                Nabo {insight.nearestTrackDistanceMeters === undefined ? "-" : formatMeters(insight.nearestTrackDistanceMeters, 1)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1630,6 +1746,12 @@ function ObjectEditor({
                 value={distanceMeters}
                 onChange={(event) => onChangeDistance(object.id, Number(event.currentTarget.value))}
               />
+              <div className="object-nudges">
+                <button onClick={() => onChangeDistance(object.id, distanceMeters - 5)}>-5 m</button>
+                <button onClick={() => onChangeDistance(object.id, distanceMeters - 1)}>-1 m</button>
+                <button onClick={() => onChangeDistance(object.id, distanceMeters + 1)}>+1 m</button>
+                <button onClick={() => onChangeDistance(object.id, distanceMeters + 5)}>+5 m</button>
+              </div>
               {object.marksFinish ? <button onClick={() => onChangeDistance(object.id, lengthMeters)}>Til slut</button> : null}
             </div>
           );
@@ -1780,6 +1902,64 @@ function RuleGuides({ project, overlay, viewBox }: { project: ProjectSnapshot; o
   );
 }
 
+function PlacementInsightOverlay({
+  insights,
+  project,
+  viewBox
+}: {
+  insights: PlacementInsight[];
+  project: ProjectSnapshot;
+  viewBox: ViewBoxState;
+}) {
+  const textSize = Math.max(4.2, viewBox.width / 96);
+  const badgeRadius = Math.max(4.2, viewBox.width / 98);
+
+  if (insights.length === 0) {
+    return null;
+  }
+
+  return (
+    <g pointerEvents="none">
+      {insights.map((insight, index) => {
+        const track = project.tracks.find((candidate) => candidate.id === insight.trackId);
+        if (!track) {
+          return null;
+        }
+        const nearest = nearestConnectorToProject(project, track);
+        const stroke = insight.status === "error" ? "#c92a2a" : insight.status === "warning" ? "#f59f00" : "#2f6235";
+
+        return (
+          <g key={`placement-insight-${insight.trackId}`}>
+            <polyline
+              points={track.points.map(pointToSvg).join(" ")}
+              fill="none"
+              stroke={stroke}
+              strokeWidth={Math.max(0.9, viewBox.width / 420)}
+              strokeDasharray="5 3"
+              opacity={0.8}
+            />
+            {nearest ? (
+              <line
+                x1={nearest.from.x}
+                y1={nearest.from.y}
+                x2={nearest.to.x}
+                y2={nearest.to.y}
+                stroke={stroke}
+                strokeWidth={Math.max(0.7, viewBox.width / 560)}
+                opacity={0.72}
+              />
+            ) : null}
+            <circle cx={insight.position.x} cy={insight.position.y} r={badgeRadius} fill="#ffffff" stroke={stroke} strokeWidth={Math.max(0.8, viewBox.width / 520)} />
+            <text x={insight.position.x} y={insight.position.y + textSize * 0.35} textAnchor="middle" fill={stroke} fontSize={textSize} fontWeight="900">
+              {index + 1}
+            </text>
+          </g>
+        );
+      })}
+    </g>
+  );
+}
+
 function GuideLabel({ guide, textSize }: { guide: DistanceGuide; textSize: number }) {
   const center = midpoint(guide.from, guide.to);
   const width = Math.max(textSize * 8.5, guide.label.length * textSize * 0.55);
@@ -1847,7 +2027,15 @@ function MapModal({
   const [query, setQuery] = useState(project.field.mapReference?.address ?? "Holbæk");
   const [results, setResults] = useState<GeocodeResult[]>([]);
   const [points, setPoints] = useState<GeocodeResult[]>([]);
+  const [rotationDegrees, setRotationDegrees] = useState(0);
   const [status, setStatus] = useState("Søg adresse og klik polygonpunkter i kortet.");
+  const projectedPreview = useMemo(
+    () =>
+      points.length >= 3
+        ? createProjectedMapPolygon(points, query, mapRef.current?.getZoom() ?? project.field.mapReference?.zoom ?? 15, rotationDegrees)
+        : undefined,
+    [points, project.field.mapReference?.zoom, query, rotationDegrees]
+  );
 
   useEffect(() => {
     if (!open || !mapElementRef.current || mapRef.current) return;
@@ -1903,24 +2091,21 @@ function MapModal({
   }
 
   function save() {
-    if (points.length < 3) {
+    if (!projectedPreview) {
       setStatus("Vælg mindst tre polygonpunkter.");
       return;
     }
-    const center = centerOf(points);
-    const mapReference = createMapReference({ centerLat: center.lat, centerLon: center.lon, zoom: mapRef.current?.getZoom() ?? 15, address: query });
-    const polygon = points.map((point) => latLonToLocalMeters(point, mapReference));
-    const areaM2 = calculatePolygonArea(polygon);
+
     onSave({
       ...project,
       field: {
         ...project.field,
         sourceType: "map",
-        mapReference,
-        polygon,
-        areaM2,
-        areaHa: areaM2 / 10_000,
-        perimeterMeters: calculatePolygonPerimeter(polygon)
+        mapReference: projectedPreview.mapReference,
+        polygon: projectedPreview.polygon,
+        areaM2: projectedPreview.areaM2,
+        areaHa: projectedPreview.areaM2 / 10_000,
+        perimeterMeters: projectedPreview.perimeterMeters
       }
     });
   }
@@ -1947,6 +2132,26 @@ function MapModal({
               </button>
             </div>
             <div className="message warning">{status}</div>
+            <label>
+              Rotation før import
+              <input
+                type="range"
+                min="-90"
+                max="90"
+                step="1"
+                value={rotationDegrees}
+                onChange={(event) => setRotationDegrees(Number(event.currentTarget.value))}
+              />
+            </label>
+            <div className="two">
+              <button onClick={() => setRotationDegrees((current) => current - 5)}>-5°</button>
+              <button onClick={() => setRotationDegrees((current) => current + 5)}>+5°</button>
+            </div>
+            <div className="message">
+              {projectedPreview
+                ? `${formatSignedDegrees(rotationDegrees)} · ${formatSquareMeters(projectedPreview.areaM2)} · ${formatHectares(projectedPreview.areaM2)} · omkreds ${formatMeters(projectedPreview.perimeterMeters, 1)}`
+                : "Areal vises, når polygonen har mindst tre punkter."}
+            </div>
             <div className="scroll stack">
               {results.map((result) => (
                 <button key={`${result.lat}-${result.lon}`} onClick={() => choose(result)}>
@@ -2146,6 +2351,41 @@ function summarizeRejectedReasons(rejectedReasons: Record<string, number>): stri
   }
 
   return `Afviste kandidater især fordi de ${entries.map(([code, count]) => `${labels[code] ?? code} (${count})`).join(", ")}.`;
+}
+
+function buildPlacementInsights(project: ProjectSnapshot, validation: ProjectValidationResult, report: PlacementReport): PlacementInsight[] {
+  const reportTrackIds = new Set(report.result.tracks.map((track) => track.id));
+
+  return project.tracks
+    .filter((track) => reportTrackIds.has(track.id))
+    .map((track) => {
+      const rules = rulesForTrack(project, track);
+      const messages = [...(validation.tracks[track.id]?.errors ?? []), ...(validation.tracks[track.id]?.warnings ?? [])];
+      const edgeGuide = edgeGuideForTrack(project, track);
+      const nearestTrack = nearestTrackGuideForTrack(project, track);
+      const spacingRequiredMeters = Math.max(project.minimumTrackSpacingMeters, rules.minTrackSpacingMeters);
+      const edgeStatus = edgeGuide ? edgeGuide.status : "ok";
+      const spacingStatus = nearestTrack ? nearestTrack.status : "ok";
+      const status = messages.some((message) => message.severity === "error")
+        ? "error"
+        : edgeStatus === "warning" || spacingStatus === "warning" || messages.some((message) => message.severity === "warning")
+          ? "warning"
+          : "ok";
+
+      return {
+        trackId: track.id,
+        name: track.name,
+        status,
+        position: track.points[0],
+        boundaryDistanceMeters: edgeGuide?.distanceMeters ?? Number.POSITIVE_INFINITY,
+        boundaryRequiredMeters: project.edgeMarginMeters,
+        nearestTrackDistanceMeters: nearestTrack?.distanceMeters,
+        nearestTrackName: nearestTrack?.relatedTrackId ? project.tracks.find((candidate) => candidate.id === nearestTrack.relatedTrackId)?.name : undefined,
+        spacingRequiredMeters,
+        lengthMeters: calculateTrackLength(track),
+        issueCount: messages.filter((message) => message.severity === "error").length
+      };
+    });
 }
 
 function fieldPrimaryAngle(polygon: Coordinate[]): number {
@@ -2379,6 +2619,60 @@ function edgeGuideForTrack(project: ProjectSnapshot, track: Track): DistanceGuid
   };
 }
 
+function nearestTrackGuideForTrack(project: ProjectSnapshot, track: Track): DistanceGuide | undefined {
+  let best: DistanceGuide | undefined;
+
+  project.tracks.forEach((otherTrack) => {
+    if (otherTrack.id === track.id) {
+      return;
+    }
+
+    const connector = nearestConnectorBetweenPolylines(track.points, otherTrack.points);
+    if (!connector) {
+      return;
+    }
+
+    const requiredMeters = Math.max(
+      project.minimumTrackSpacingMeters,
+      rulesForTrack(project, track).minTrackSpacingMeters,
+      rulesForTrack(project, otherTrack).minTrackSpacingMeters
+    );
+    const crosses = trackIntersectionPoints(track, otherTrack).length > 0;
+    const guide: DistanceGuide = {
+      id: `nearest-${track.id}-${otherTrack.id}`,
+      label: crosses ? `${track.name} krydser ${otherTrack.name}` : `${track.name} til ${otherTrack.name}`,
+      from: connector.from,
+      to: connector.to,
+      distanceMeters: connector.distanceMeters,
+      requiredMeters,
+      status: crosses ? "error" : clearanceStatus(connector.distanceMeters, requiredMeters),
+      trackId: track.id,
+      relatedTrackId: otherTrack.id
+    };
+
+    if (!best || guide.distanceMeters < best.distanceMeters) {
+      best = guide;
+    }
+  });
+
+  return best;
+}
+
+function nearestConnectorToProject(project: ProjectSnapshot, track: Track): SegmentConnector | undefined {
+  const edge = nearestConnectorToPolygon(track.points, project.field.polygon);
+  const nearestTrack = nearestTrackGuideForTrack(project, track);
+
+  if (!edge) {
+    return nearestTrack ? { from: nearestTrack.from, to: nearestTrack.to, distanceMeters: nearestTrack.distanceMeters } : undefined;
+  }
+
+  if (!nearestTrack || edge.distanceMeters <= nearestTrack.distanceMeters) {
+    return edge;
+  }
+
+  return { from: nearestTrack.from, to: nearestTrack.to, distanceMeters: nearestTrack.distanceMeters };
+}
+
 function clearanceStatus(distanceMeters: number, requiredMeters: number): RuleStatus {
   if (distanceMeters + 1e-6 < requiredMeters) {
     return "error";
@@ -2563,15 +2857,40 @@ function scaledSegments(segments: number[], targetLengthMeters: number): number[
   return segments.map((length) => length * scale);
 }
 
+function estimateTrackCapacities(project: ProjectSnapshot): CapacityEstimate[] {
+  return trackProfiles.map((profile) => {
+    const resolved = resolveTrackProfile(profile.code, project);
+    return estimateTrackCapacityDetailed(project, resolved.template, resolved.label);
+  });
+}
+
 function estimateTrackCapacity(project: ProjectSnapshot, template: TrackTemplateRules): number {
+  return estimateTrackCapacityDetailed(project, template, template.name).suggestedTrackCount;
+}
+
+function estimateTrackCapacityDetailed(project: ProjectSnapshot, template: TrackTemplateRules, label: string): CapacityEstimate {
   const spacing = Math.max(project.minimumTrackSpacingMeters, template.minTrackSpacingMeters);
   const bounds = polygonBounds(project.field.polygon);
   const sideLength = Math.max(1, (template.lengthMeters - template.minMiddleSegmentMeters) / 2);
   const cellWidth = sideLength + spacing;
   const cellHeight = Math.max(template.minMiddleSegmentMeters, bounds.height * 0.12, 1) + spacing;
-  const edgePenaltyArea = project.field.perimeterMeters * project.edgeMarginMeters;
+  const turnComplexity = template.turnCount >= 6 ? 1.45 : template.turnCount >= 3 ? 1.2 : 1;
+  const edgePenaltyArea = project.field.perimeterMeters * project.edgeMarginMeters + project.edgeMarginMeters * project.edgeMarginMeters * 4;
   const usableAreaM2 = Math.max(0, project.field.areaM2 - edgePenaltyArea);
-  return normalizeTrackCount(Math.max(1, Math.floor(usableAreaM2 / Math.max(1, cellWidth * cellHeight))));
+  const areaPerTrackM2 = Math.max(1, cellWidth * cellHeight * turnComplexity);
+  const optimisticTrackCount = normalizeTrackCount(Math.max(1, Math.floor(usableAreaM2 / areaPerTrackM2)));
+  const suggestedTrackCount = normalizeTrackCount(Math.max(1, Math.floor(optimisticTrackCount * 0.78)));
+
+  return {
+    code: template.code,
+    label,
+    suggestedTrackCount,
+    optimisticTrackCount,
+    usableAreaM2,
+    areaPerTrackM2,
+    spacingMeters: spacing,
+    lengthMeters: template.lengthMeters
+  };
 }
 
 function withActiveTemplate(project: ProjectSnapshot, template: TrackTemplateRules): ProjectSnapshot {
@@ -2737,6 +3056,234 @@ function projectToTrackSheetHtml(project: ProjectSnapshot): string {
     ${trackSections}
   </body>
 </html>`;
+}
+
+async function projectToTrackSheetPdfBlob(project: ProjectSnapshot): Promise<Blob> {
+  const { jsPDF } = await import("jspdf");
+  const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+  const validation = validateProject(project);
+
+  drawPdfCover(doc, project, validation);
+  project.tracks.forEach((track) => {
+    doc.addPage();
+    drawPdfTrackSheetPage(doc, project, validation, track);
+  });
+
+  return doc.output("blob");
+}
+
+type PreviewPdfDocument = {
+  setFont: (fontName: string, fontStyle?: string) => PreviewPdfDocument;
+  setFontSize: (size: number) => PreviewPdfDocument;
+  setDrawColor: (color: string) => PreviewPdfDocument;
+  setFillColor: (color: string) => PreviewPdfDocument;
+  setLineWidth: (width: number) => PreviewPdfDocument;
+  setTextColor: (color: string) => PreviewPdfDocument;
+  text: (text: string, x: number, y: number, options?: { maxWidth?: number; align?: "left" | "center" | "right" }) => PreviewPdfDocument;
+  line: (x1: number, y1: number, x2: number, y2: number) => PreviewPdfDocument;
+  circle: (x: number, y: number, radius: number, style?: string) => PreviewPdfDocument;
+  rect: (x: number, y: number, width: number, height: number, style?: string) => PreviewPdfDocument;
+  addPage: () => PreviewPdfDocument;
+  output: (type: "blob") => Blob;
+};
+
+function drawPdfCover(doc: PreviewPdfDocument, project: ProjectSnapshot, validation: ProjectValidationResult) {
+  drawPdfHeader(doc, project.name, "Samlet sporlæggerark");
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(10);
+  doc.text(`${project.club || "-"} · ${project.eventName || "-"} · ${formatSquareMeters(project.field.areaM2)} · ${formatHectares(project.field.areaM2)}`, 16, 30);
+
+  drawPdfMetric(doc, 16, 42, "Spor", String(project.tracks.length));
+  drawPdfMetric(doc, 63, 42, "Status", validation.valid ? "Gyldig" : `${validation.errors.length} fejl`);
+  drawPdfMetric(doc, 110, 42, "Kantmargin", formatMeters(project.edgeMarginMeters, 0));
+  drawPdfMetric(doc, 157, 42, "Sporafstand", formatMeters(project.minimumTrackSpacingMeters, 0));
+  drawPdfOverview(doc, project, { x: 16, y: 68, width: 178, height: 105 });
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(12);
+  doc.text("Sporoversigt", 16, 188);
+  drawPdfTrackOverviewTable(doc, project, validation, 16, 198);
+}
+
+function drawPdfTrackSheetPage(doc: PreviewPdfDocument, project: ProjectSnapshot, validation: ProjectValidationResult, track: Track) {
+  const rules = rulesForTrack(project, track);
+  const checks = buildTrackRuleChecks(project, track, validation);
+  const segmentLengths = calculateSegmentLengths(track.points);
+  const turnAngles = calculateTurnAngles(track.points);
+
+  drawPdfHeader(doc, `Sporlæggerark - ${track.name}`, rules.name);
+  drawPdfTrackDiagram(doc, track, { x: 16, y: 34, width: 178, height: 78 });
+
+  drawPdfMetric(doc, 16, 122, "Længde", formatMeters(calculateTrackLength(track), 1));
+  drawPdfMetric(doc, 63, 122, "Skridt", `${track.lengthSteps}`);
+  drawPdfMetric(doc, 110, 122, "Genstande", `${track.objects.length}`);
+  drawPdfMetric(doc, 157, 122, "Status", checks.some((check) => check.status === "error") ? "Fejl" : "OK");
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(11);
+  doc.text("Segmenter og knæk", 16, 154);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  doc.text(segmentLengths.map((length, index) => `${index + 1}: ${formatMeters(length, 1)}`).join("   "), 16, 163, { maxWidth: 178 });
+  doc.text(`Knæk: ${turnAngles.map((angle) => `${Math.round(angle)}°`).join("   ") || "-"}`, 16, 171, { maxWidth: 178 });
+
+  doc.setFont("helvetica", "bold");
+  doc.text("Genstande", 16, 186);
+  doc.setFont("helvetica", "normal");
+  track.objects.forEach((object, index) => {
+    doc.text(`G${object.displayNo}: ${formatMeters(object.distanceAlongTrackMeters, 1)} fra start · ${object.material}`, 16, 195 + index * 7);
+  });
+
+  doc.setFont("helvetica", "bold");
+  doc.text("Regelstatus", 104, 186);
+  doc.setFont("helvetica", "normal");
+  checks.slice(0, 6).forEach((check, index) => {
+    doc.setTextColor(check.status === "error" ? "#c92a2a" : check.status === "warning" ? "#9c6b00" : "#2b8a3e");
+    doc.text(`${statusLabel(check.status)} · ${check.label}: ${check.value}`, 104, 195 + index * 7, { maxWidth: 90 });
+  });
+  doc.setTextColor("#16201b");
+
+  doc.setDrawColor("#d7ded7");
+  doc.rect(16, 245, 178, 34);
+  doc.setFont("helvetica", "bold");
+  doc.text("Noter", 20, 254);
+  doc.setFont("helvetica", "normal");
+  doc.line(20, 263, 190, 263);
+  doc.line(20, 273, 190, 273);
+}
+
+function drawPdfHeader(doc: PreviewPdfDocument, title: string, subtitle: string) {
+  doc.setFillColor("#eef8ee");
+  doc.rect(0, 0, 210, 22, "F");
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.setTextColor("#16201b");
+  doc.text(title, 16, 14);
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  doc.setTextColor("#34443a");
+  doc.text(subtitle, 16, 20);
+  doc.setTextColor("#16201b");
+}
+
+function drawPdfMetric(doc: PreviewPdfDocument, x: number, y: number, label: string, value: string) {
+  doc.setFillColor("#f7faf7");
+  doc.setDrawColor("#d7ded7");
+  doc.rect(x, y, 37, 18, "FD");
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(7);
+  doc.setTextColor("#637168");
+  doc.text(label, x + 3, y + 6);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(10);
+  doc.setTextColor("#16201b");
+  doc.text(value, x + 3, y + 14, { maxWidth: 31 });
+}
+
+function drawPdfOverview(doc: PreviewPdfDocument, project: ProjectSnapshot, frame: { x: number; y: number; width: number; height: number }) {
+  const transform = createPdfProjectTransform(project, frame);
+  doc.setFillColor("#f7faf7");
+  doc.setDrawColor("#d7ded7");
+  doc.rect(frame.x, frame.y, frame.width, frame.height, "FD");
+  doc.setDrawColor("#2f6235");
+  doc.setLineWidth(0.55);
+  drawPdfClosedPolyline(doc, project.field.polygon.map(transform));
+
+  project.restrictedAreas
+    .filter((area) => area.active && area.type === "polygon")
+    .forEach((area) => {
+      if (area.type !== "polygon") return;
+      doc.setDrawColor(area.color);
+      doc.setLineWidth(0.35);
+      drawPdfClosedPolyline(doc, area.polygon.map(transform));
+    });
+
+  project.tracks.forEach((track) => {
+    doc.setDrawColor(track.color);
+    doc.setLineWidth(0.75);
+    drawPdfOpenPolyline(doc, track.points.map(transform));
+    const start = transform(track.points[0]);
+    const finish = transform(track.points[track.points.length - 1]);
+    doc.circle(start.x, start.y, 1.4, "S");
+    doc.rect(finish.x - 1.1, finish.y - 1.1, 2.2, 2.2);
+    doc.setFontSize(6);
+    doc.setTextColor(track.color);
+    doc.text(String(track.displayNo), start.x + 1.8, start.y - 1.2);
+  });
+  doc.setTextColor("#16201b");
+}
+
+function drawPdfTrackDiagram(doc: PreviewPdfDocument, track: Track, frame: { x: number; y: number; width: number; height: number }) {
+  const transform = createPdfPointTransform(track.points, frame);
+  doc.setFillColor("#f7faf7");
+  doc.setDrawColor("#d7ded7");
+  doc.rect(frame.x, frame.y, frame.width, frame.height, "FD");
+  doc.setDrawColor(track.color);
+  doc.setLineWidth(1);
+  drawPdfOpenPolyline(doc, track.points.map(transform));
+  const start = transform(track.points[0]);
+  const finish = transform(track.points[track.points.length - 1]);
+  doc.circle(start.x, start.y, 2, "S");
+  doc.rect(finish.x - 1.6, finish.y - 1.6, 3.2, 3.2);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(7);
+  doc.setTextColor("#16201b");
+  doc.text("Start", start.x + 3, start.y - 2);
+  doc.text("Slut", finish.x + 3, finish.y - 2);
+  track.objects.forEach((object) => {
+    const position = transform(coordinateAtDistance(track.points, object.distanceAlongTrackMeters));
+    doc.circle(position.x, position.y, 1.5, "S");
+    doc.text(`G${object.displayNo}`, position.x + 2.4, position.y - 1.3);
+  });
+}
+
+function drawPdfTrackOverviewTable(doc: PreviewPdfDocument, project: ProjectSnapshot, validation: ProjectValidationResult, x: number, y: number) {
+  doc.setFontSize(8);
+  project.tracks.slice(0, 18).forEach((track, index) => {
+    const rowY = y + index * 6;
+    const checks = buildTrackRuleChecks(project, track, validation);
+    const status = checks.some((check) => check.status === "error") ? "Fejl" : checks.some((check) => check.status === "warning") ? "Obs" : "OK";
+    doc.setDrawColor(track.color);
+    doc.setLineWidth(1);
+    doc.line(x, rowY - 1.2, x + 9, rowY - 1.2);
+    doc.setTextColor("#16201b");
+    doc.text(`${track.name}`, x + 12, rowY);
+    doc.text(`${rulesForTrack(project, track).name}`, x + 55, rowY);
+    doc.text(formatMeters(calculateTrackLength(track), 1), x + 112, rowY);
+    doc.text(status, x + 150, rowY);
+  });
+}
+
+function createPdfProjectTransform(project: ProjectSnapshot, frame: { x: number; y: number; width: number; height: number }) {
+  const points = [
+    ...project.field.polygon,
+    ...project.tracks.flatMap((track) => track.points),
+    ...project.restrictedAreas.flatMap((area) => (area.type === "polygon" ? area.polygon : []))
+  ];
+  return createPdfPointTransform(points, frame);
+}
+
+function createPdfPointTransform(points: Coordinate[], frame: { x: number; y: number; width: number; height: number }) {
+  const bounds = polygonBounds(points);
+  const scale = Math.min(frame.width / Math.max(1, bounds.width), frame.height / Math.max(1, bounds.height));
+  const xPad = (frame.width - bounds.width * scale) / 2;
+  const yPad = (frame.height - bounds.height * scale) / 2;
+
+  return (point: Coordinate): Coordinate => ({
+    x: frame.x + xPad + (point.x - bounds.minX) * scale,
+    y: frame.y + yPad + (point.y - bounds.minY) * scale
+  });
+}
+
+function drawPdfOpenPolyline(doc: PreviewPdfDocument, points: Coordinate[]) {
+  points.slice(1).forEach((point, index) => {
+    const previous = points[index];
+    doc.line(previous.x, previous.y, point.x, point.y);
+  });
+}
+
+function drawPdfClosedPolyline(doc: PreviewPdfDocument, points: Coordinate[]) {
+  drawPdfOpenPolyline(doc, [...points, points[0]]);
 }
 
 function statusLabel(status: RuleStatus): string {
@@ -2944,6 +3491,22 @@ function projectLatLonIfDetected(points: Coordinate[]):
   };
 }
 
+function createProjectedMapPolygon(points: GeocodeResult[], address: string, zoom: number, rotationDegrees: number) {
+  const center = centerOf(points);
+  const mapReference = createMapReference({ centerLat: center.lat, centerLon: center.lon, zoom, address });
+  const rawPolygon = points.map((point) => latLonToLocalMeters(point, mapReference));
+  const origin = polygonCenter(rawPolygon);
+  const polygon = rotationDegrees === 0 ? rawPolygon : rawPolygon.map((point) => rotatePoint(point, rotationDegrees, origin));
+  const areaM2 = calculatePolygonArea(polygon);
+
+  return {
+    mapReference,
+    polygon,
+    areaM2,
+    perimeterMeters: calculatePolygonPerimeter(polygon)
+  };
+}
+
 function scalePolygon(polygon: Coordinate[], scale: number): Coordinate[] {
   const center = polygon.reduce((accumulator, point) => ({ x: accumulator.x + point.x, y: accumulator.y + point.y }), { x: 0, y: 0 });
   const origin = { x: center.x / polygon.length, y: center.y / polygon.length };
@@ -2982,8 +3545,8 @@ function readImageDimensions(file: File): Promise<{ width: number; height: numbe
   });
 }
 
-function downloadBlob(content: string, fileName: string, type: string) {
-  const blob = new Blob([content], { type });
+function downloadBlob(content: string | Blob, fileName: string, type: string) {
+  const blob = content instanceof Blob ? content : new Blob([content], { type });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
